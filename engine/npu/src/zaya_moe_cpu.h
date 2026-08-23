@@ -83,7 +83,8 @@ struct RouterWeights {
 //   return top-1 expert (0..n_exp-1)
 inline int router(const MoeDims& d, const RouterWeights& w,
                   const float* hs, std::vector<float>& prev_router,
-                  float* expert_wt) {
+                  float* expert_wt, float* dbg_top2 = nullptr,
+                  int* dbg_top2_idx = nullptr) {
     const int H = d.H, rtr_h = d.rtr_h, n_exp = d.n_exp, n_exp_t = d.n_exp_t;
 
     // 1. gate_down: rs[i] = gdb[i] + sum_j hs[j]*gdw[j*rtr_h + i]
@@ -132,11 +133,15 @@ inline int router(const MoeDims& d, const RouterWeights& w,
 
     // 8. exp_probs = probs[0:16] + balancing_biases[0:16]; top-1 over 16
     int best = 0; float bv = logits[0] + w.bb[0];
+    int best2 = -1; float bv2 = -1e30f;
     for (int i = 1; i < n_exp; i++) {
         float v = logits[i] + w.bb[i];
-        if (v > bv) { bv = v; best = i; }
+        if (v > bv) { bv2 = bv; best2 = best; bv = v; best = i; }
+        else if (v > bv2) { bv2 = v; best2 = i; }
     }
     if (expert_wt) *expert_wt = bv;
+    if (dbg_top2) { dbg_top2[0] = bv; dbg_top2[1] = bv2; }
+    if (dbg_top2_idx) { dbg_top2_idx[0] = best; dbg_top2_idx[1] = best2; }
     return best;
 }
 

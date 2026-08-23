@@ -336,7 +336,18 @@ int main(int argc, char** argv) {
                 auto t0 = std::chrono::steady_clock::now();
                 // MoE FFN (NPU): router on CPU, GEMMs on NPU with resident experts.
                 float wt;
-                int e = zaya_moe::router(m, w.rw, residual.data(), prev_router, &wt);
+                float dbg_t2[2] = {0, 0}; int dbg_t2i[2] = {-1, -1};
+                int e = zaya_moe::router(m, w.rw, residual.data(), prev_router, &wt,
+                                        npu_dbg_fp ? dbg_t2 : nullptr,
+                                        npu_dbg_fp ? dbg_t2i : nullptr);
+                if (pos == 0 && npu_dbg_fp) {
+                    fprintf(stderr, "[fp-r] l=%d e=%d top1=%.9f(%d) top2=%.9f(%d) gap=%.3e | res_16=", l, e,
+                            dbg_t2[0], dbg_t2i[0], dbg_t2[1], dbg_t2i[1], dbg_t2[0]-dbg_t2[1]);
+                    for (int i = 0; i < 16 && i < d.H; i++) fprintf(stderr, " %d", (int)lrintf(residual[i]));
+                    fprintf(stderr, " | pr_4=");
+                    for (int i = 0; i < 4 && (size_t)i < prev_router.size(); i++) fprintf(stderr, " %.6f", prev_router[i]);
+                    fprintf(stderr, "\n");
+                }
                 gu_ctx.group_scales[l] = gu_cs[l][e];
                 d_ctx.group_scales[l] = d_cs[l][e];
                 float ag = dynamic_ascale(residual.data(), d.H);
