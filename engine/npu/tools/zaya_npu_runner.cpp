@@ -377,10 +377,21 @@ int main(int argc, char** argv) {
                     for (int i = 0; i < d.H; i++)      c2s += moe_out[i];
                     fprintf(stderr, "[fp] l=%d e=%d c1_sum=%.6f h2_sum=%.6f c2_sum=%.6f | c1_16=", l, e, c1s, h2s, c2s);
                     for (int i = 0; i < 16 && i < 2*m.n_ff; i++) fprintf(stderr, " %d", (int)lrintf(gu_out[i]));
+                    fprintf(stderr, " | c2_16=");
+                    for (int i = 0; i < 16 && i < d.H; i++) fprintf(stderr, " %d", (int)lrintf(moe_out[i]));
                     fprintf(stderr, "\n");
                 }
                 for (int i = 0; i < d.H; i++) h[i] = moe_out[i];
                 moe_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            }
+            // Issue #1799: per-layer h fingerprint (ALL layers, pos 0) — the
+            // first layer whose h differs across runs localizes the divergence
+            // (readback race vs CPU-attention vs router) exactly.
+            if (pos == 0 && npu_dbg_fp) {
+                double hsum = 0; for (int i = 0; i < d.H; i++) hsum += h[i];
+                fprintf(stderr, "[fp-h] l=%d h_sum=%.6f | h_16=", l, hsum);
+                for (int i = 0; i < 16 && i < d.H; i++) fprintf(stderr, " %d", (int)lrintf(h[i]));
+                fprintf(stderr, "\n");
             }
         }
         for (int i = 0; i < d.H; i++) tmp[i] = h[i] + residual[i];
