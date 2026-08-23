@@ -260,6 +260,9 @@ int main(int argc, char** argv) {
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tp0).count());
     }
 
+    // Issue #1799: per-layer readback fingerprints at pos 0 (NPU_DBG_FP=1).
+    const bool npu_dbg_fp = getenv("NPU_DBG_FP") && atoi(getenv("NPU_DBG_FP")) == 1;
+
     auto forward = [&](int tok, int pos) -> int {
         for (int i = 0; i < d.H; i++) h[i] = (embed[(size_t)tok * d.H + i] + ibias[i]) * iscale[i];
         double attn_ms = 0, moe_ms = 0, gu_ms = 0, d_ms = 0;
@@ -361,6 +364,20 @@ int main(int argc, char** argv) {
                     }
                     fprintf(stderr, "[MoE L1 dbg] corr=%.6f maxdiff=%.6f (cpu rms=%.4f npu rms=%.4f)\n",
                         num/std::sqrt(d1*d2), maxd, std::sqrt(d1/d.H), std::sqrt(d2/d.H));
+                }
+                // Issue #1799: per-layer readback fingerprints (NPU_DBG_FP=1).
+                // C1 = GU output BO readback (gu_out), h2 = host silu (feeds D),
+                // C2 = D output BO readback (moe_out). Dumped at pos 0 so every
+                // MoE layer's writeback state is captured across runs — the
+                // S2MM-writeback-visibility suspect (TCT != DDR visibility).
+                if (pos == 0 && npu_dbg_fp) {
+                    double c1s=0, h2s=0, c2s=0;
+                    for (int i = 0; i < 2*m.n_ff; i++) c1s += gu_out[i];
+                    for (int i = 0; i < m.n_ff; i++)   h2s += silu[i];
+                    for (int i = 0; i < d.H; i++)      c2s += moe_out[i];
+                    fprintf(stderr, "[fp] l=%d e=%d c1_sum=%.6f h2_sum=%.6f c2_sum=%.6f | c1_16=", l, e, c1s, h2s, c2s);
+                    for (int i = 0; i < 16 && i < 2*m.n_ff; i++) fprintf(stderr, " %d", (int)lrintf(gu_out[i]));
+                    fprintf(stderr, "\n");
                 }
                 for (int i = 0; i < d.H; i++) h[i] = moe_out[i];
                 moe_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
