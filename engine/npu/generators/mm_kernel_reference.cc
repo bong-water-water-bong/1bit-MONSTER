@@ -674,12 +674,6 @@ extern "C" void zero_i32(int32_t *c_out) {
 //
 // First cut: scalar dequant (correctness-first; vectorization = measured
 // optimization once the corr gate passes on NPU).
-// bring-up trace (issue #1769): first nibble bytes of the int4 B tile,
-// the dequantized B'' and the raw scale bytes the kernel read
-static uint8_t g_i4_trace_b[64];   // last matmul (ki=31) nibbles
-static uint8_t g_i4_trace_b0[64];  // first matmul (ki=0) nibbles
-static uint8_t g_i4_trace_dq[64];
-static uint8_t g_i4_trace_sc[32];
 extern "C" void matmul_i8_i32_i4(const int8_t *__restrict pA,
                                  const uint8_t *__restrict pB4,
                                  int32_t *__restrict pC) {
@@ -712,7 +706,6 @@ extern "C" void matmul_i8_i32_i4(const int8_t *__restrict pA,
     // iterate col-tiles in groups of 4.
     for (unsigned jg = 0; jg < nct; jg += 4) {
         int32_t *pC1 = pC + jg * MMUL::size_C;
-        if (jg == 0) for (unsigned t = 0; t < 64; t++) g_i4_trace_b0[t] = pB4[t];   // col-tile j at j*64 (microtiled C1)
         aie::vector<int32, 64> acc0 = aie::load_v<64>(pC1);
         aie::vector<int32, 64> acc1 = aie::load_v<64>(pC1 + 64);
         aie::vector<int32, 64> acc2 = aie::load_v<64>(pC1 + 128);
@@ -730,16 +723,14 @@ extern "C" void matmul_i8_i32_i4(const int8_t *__restrict pA,
                 // ratio (measured: NaN on the NPU), so the dequant is PURE
                 // int32: B'' = sat8(round(q4*16*ratio)) = sat8(round(q4*rq/2^28)).
                 const int32_t* rq = (const int32_t*)(pB4 + 5120 + (i / 4) * 512 + j * 32);
-                // v52: VECTORIZED q4 unpack (aie2p intrinsic) + scalar int32
-                // ratio multiply — B'' = sat8(round(q4*16*ratio)).
-                v64int8 q16 = __builtin_aie2p_unpack_I512_I8_I4(
-                    *(const v64int4 *)(pB4 + i * 512 + j * 32), 1);   // sign-extended q4
-                q16 = q16 + q16; q16 = q16 + q16;
-                q16 = q16 + q16; q16 = q16 + q16;                     // x16 (q4<<4)
-                int8_t qs[64];
-                *(v64int8 *)qs = q16;
+                // v54: SCALAR q4 unpack (the vector intrinsic's lane order
+                // differs from the CPU unpack — measured: the C1 diverged
+                // from the verified bit-exact reference; reverted).
                 for (int e = 0; e < 64; e++) {
-                    int x = (int)qs[e] * rq[e & 7];       // q4*16 * ratioQ22/2^18
+                    uint8_t b = nib[(e / 8) * 4 + (e % 8) / 2];
+                    int q4 = (e % 2 == 0) ? (int)(b & 0x0F) : (int)((b >> 4) & 0x0F);
+                    if (q4 >= 8) q4 -= 16;
+                    int x = q4 * rq[e & 7];               // q4 * ratioQ22 (int32)
                     int ax = x < 0 ? -x : x;
                     int r = (ax + (1 << 17)) >> 18;          // round-half-away
                     r = x < 0 ? -r : r;
@@ -760,17 +751,34 @@ extern "C" void matmul_i8_i32_i4(const int8_t *__restrict pA,
         aie::store_v(pC1 + 128, C02.template to_vector<int32>());
         aie::store_v(pC1 + 192, C03.template to_vector<int32>());
     }
-    // v3: stash this tile's per-token fold (128 bf16 at [4864, 5120) of the
-    // 5120-B tile) into C1 row 1 as float bit patterns — the silu reads them
-    // there (the 33rd B object per col_group never delivered). The LAST
-    // matmul's stash wins before the silu runs.
-    {
-        // v51: stash the foldQ22 (host-precomputed int32 at [6656 + j*4])
-        // CONTIGUOUSLY at 0x76000 — the fixed-point silu consumes it.
-        const int32_t* fq = (const int32_t*)(pB4 + 6656);
-        for (int j = 0; j < 128; j++) ((int32_t *)0x6000)[j] = fq[j];
-    }
     event1();
+}
+
+// CPU-silu fallback (issue #1769): the P1 kernel emits the VERIFIED C1 to the
+// C1_out fifo (bo2) so the HOST computes the silu (the on-core silu is
+// mis-compiled by the aie2p backend, issue #1836). A PURE int32 copy — no
+// float, no LUT, no memcpy — immune to the toolchain's mis-compiled loops.
+// The copy source/target are HARDCODED LOCAL addresses (0x7d000 = C1buf,
+// 0x7c000 = the C1_C0 fifo slot — this generator's basic-sequential
+// allocation, verified in the built core ELF): the aiecc's extern-call arg
+// setup is unreliable (issue #1837 — the 3rd arg is emitted AFTER the call),
+// so the args are ignored. Each core's local address space is private, so the
+// same constants address each core's own C1buf/fifo slot (the established
+// hardcoded-address pattern — the silu's 0x7F000 h2 target).
+extern "C" void c1_emit(const int32_t *src, const uint8_t *unused, int32_t *dst) {
+    const int32_t *s = (const int32_t *)0x7d000;
+    int32_t *d = (int32_t *)0x7c000;
+    for (unsigned i = 0; i < DIM_M * DIM_N; i++) d[i] = s[i];
+}
+
+// Zero the C1buf (HARDCODED local 0x7d000) before each col_group's
+// accumulation. The generic zero_i32 takes its target as an arg, which the
+// aiecc does not deliver reliably (issue #1837 — the arg is emitted after
+// the call); the C1buf's boot content is nonzero, so an un-zeroed C1buf
+// corrupts the first matmul's accumulation (measured: C1 = garbage).
+extern "C" void zero_c1(void) {
+    int32_t *d = (int32_t *)0x7d000;
+    for (unsigned i = 0; i < DIM_M * DIM_N; i++) d[i] = 0;
 }
 
 

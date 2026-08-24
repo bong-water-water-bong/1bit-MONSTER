@@ -248,6 +248,10 @@ int zaya_decode_main(int argc, char** argv) {
     std::vector<std::unique_ptr<xrt::bo>> h2_bo(NC);  // per-MoE-layer scratch (issue #1775 hang probe)
     if (FUSED) {
         fused_ctx.MD = 8; fused_ctx.KD = d.H; fused_ctx.ND = d.H;
+        // The int4 P1 kernel writes the FULL C1 (32 chunks x 4 KB = 128 KB)
+        // to bo2 (CPU-silu fallback, issue #1769) while ND is the D output
+        // width (2048) — enlarge bC via bC_nd (npu_engine_i8ctx_inc.h).
+        fused_ctx.bC_nd = 2 * m.n_ff;
         char fx[512], fi[512];
         // Split launch (issue #1775): p1 = GU->SiLU->h2 writeback, p2 = D
         // reading h2 from bo4. A host-side h2_bo sync between the launches
@@ -444,26 +448,51 @@ int zaya_decode_main(int argc, char** argv) {
                     else
                         fused_ctx.update_fused_header(*fgu_bo[l][e], fgu_cs[l][e], m.n_ff, ag, qn_s, 2 * m.n_ff);
                     auto tb1 = std::chrono::steady_clock::now();
-                    // P1: GU->SiLU->h2 writeback.
+                    // P1: GU GEMM → C1 writeback to bo2 (the CPU-silu
+                    // fallback, issue #1769/#1836: the on-core silu is
+                    // mis-compiled by the aie2p backend, so the P1 kernel
+                    // only writes the C1 — 32 chunks x 4 KB — and the HOST
+                    // computes the silu from the verified bit-exact C1).
                     auto frun = fused_ctx.launch_fused(*fgu_bo[l][e], *fd_bo[l][e], *h2_bo[l],
                                                        residual.data(), 1, d.H, ag);
                     auto tb2 = std::chrono::steady_clock::now();
                     frun.wait();
-                    // Visibility barrier (issue #1775 fix): the h2 S2MM
-                    // writeback (shim[c] -> DDR) must be globally visible
-                    // before the P2 D-phase MM2S read (shim[0]). The host
-                    // sync forces the write path to drain.
-                    h2_bo[l]->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-                    // Force the coherent write path to drain: actually read a
-                    // few h2 bytes host-side (the P1 S2MM writes go through
-                    // the coherent host path; a sync alone can be a no-op for
-                    // HOST_ONLY BOs, but a real read must observe the data).
+                    // CPU silu: reading the C1 IS the visibility barrier
+                    // (issue #1775 — the P1 S2MM writeback must be globally
+                    // visible before the host reads it). Then compute
+                    //   h2 = sat8(round(silu_lut(g)·u)),
+                    //   g  = C1[2p]·ag·S_col[2p],
+                    //   u  = C1[2p+1]·ag·qn_s·S_col[2p+1]
+                    // (the exact silu_quant.h contract, folds per
+                    // update_fused_header_i4) and write h2 to bo4 in the
+                    // A-layout (r·2048 + (c/8)·8 + c%8) for the D read.
                     {
-                        const volatile int8_t* h2m =
-                            (const volatile int8_t*)h2_bo[l]->map();
-                        volatile int sink = 0;
-                        for (int i = 0; i < 64; i++) sink += h2m[i];
-                        (void)sink;
+                        fused_ctx.bC->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+                        const int32_t* c1m = fused_ctx.Cm;
+                        const int H2n = m.n_ff;                     // 2048
+                        const std::vector<float>& scol = fgu_cs[l][e];  // S_col
+                        std::vector<float> fold(2 * H2n);           // S' per GU col
+                        for (int p = 0; p < H2n; p++) {
+                            fold[2 * p]     = ag * scol[2 * p];          // gate
+                            fold[2 * p + 1] = ag * qn_s * scol[2 * p + 1]; // up
+                        }
+                        int8_t* h2m = (int8_t*)h2_bo[l]->map();
+                        std::vector<int32_t> C1row(2 * H2n);
+                        std::vector<int8_t> h2row(H2n);
+                        for (int r = 0; r < 8; r++) {
+                            // Microtiled C1: element (r, c) of chunk kc at
+                            // kc·1024 + (c/8)·64 + r·8 + (c%8) → row-major.
+                            for (int p = 0; p < H2n; p++) {
+                                for (int t = 0; t < 2; t++) {
+                                    int j = 2 * p + t, kc = j >> 7, c = j & 127;
+                                    C1row[j] = c1m[kc * 1024 + (c >> 3) * 64 + r * 8 + (c & 7)];
+                                }
+                            }
+                            silu_quant_i8(C1row.data(), fold.data(), h2row.data(), H2n);
+                            for (int p = 0; p < H2n; p++)
+                                h2m[(size_t)r * H2n + (p >> 3) * 8 + (p & 7)] = h2row[p];
+                        }
+                        h2_bo[l]->sync(XCL_BO_SYNC_BO_TO_DEVICE);
                     }
                     // P2: D GEMM reading h2 from bo4.
                     auto frun2 = fused_ctx_p2.launch_fused(*fgu_bo[l][e], *fd_bo[l][e], *h2_bo[l],
@@ -482,6 +511,31 @@ int zaya_decode_main(int argc, char** argv) {
                         for (int i = 0; i < d.H; i++) {
                             num += (double)cpu_out[i]*moe_out[i]; d1 += (double)cpu_out[i]*cpu_out[i]; d2 += (double)moe_out[i]*moe_out[i];
                             maxd = std::max(maxd, std::fabs(cpu_out[i]-moe_out[i]));
+                        }
+                        {
+                            // CPU-silu fallback probe: the P1 C1 readback
+                            // (chunk 0, row 0 = GU cols 0..7) vs the CPU
+                            // reference C1h from the int8 shadow.
+                            float ag2 = 0;
+                            for (int i = 0; i < d.H; i++) ag2 = std::max(ag2, std::fabs(residual[i]));
+                            ag2 = ag2 < 1e-12f ? 1.0f : ag2 / 127.0f;
+                            std::vector<int8_t> Ai(d.H);
+                            for (int i = 0; i < d.H; i++) {
+                                int x = (int)std::roundf(residual[i] / ag2);
+                                Ai[i] = (int8_t)(x > 127 ? 127 : x < -127 ? -127 : x);
+                            }
+                            const int N2 = 2 * m.n_ff;
+                            std::vector<int32_t> C1h(N2, 0);
+                            const std::vector<int8_t>& guBv2 = fgu_row[l][e];
+                            for (int j = 0; j < N2; j++)
+                                for (int i = 0; i < d.H; i++)
+                                    C1h[j] += (int32_t)Ai[i] * guBv2[(size_t)i * N2 + j];
+                            const int32_t* c1m = fused_ctx.Cm;
+                            fprintf(stderr, "[c1cmp] cpu: ");
+                            for (int j = 0; j < 8; j++) fprintf(stderr, "%d ", C1h[j]);
+                            fprintf(stderr, "\n[c1cmp] npu: ");
+                            for (int j = 0; j < 8; j++) fprintf(stderr, "%d ", c1m[j]);
+                            fprintf(stderr, "\n");
                         }
                         fprintf(stderr, "[MoE L1 fused dbg] corr=%.6f maxdiff=%.6f (cpu rms=%.4f npu rms=%.4f) qn_s=%.4f\n",
                             num/std::sqrt(d1*d2), maxd, std::sqrt(d1/d.H), std::sqrt(d2/d.H), qn_s);

@@ -121,6 +121,15 @@ def my_fused_p1(M, K, N_GU, N_D, m, k, n, n_aie_cols=8, BATCH_SIZE=2):
         silu = external_func("silu_quant_i8_fused_i4", inputs=[C_ty, B4_ty, H2_ty], link_with=kernel_o)
         matmul_i4 = external_func("matmul_i8_i32_i4", inputs=[A_ty, B4_ty, C_ty],
                                   link_with=kernel_o)   # (A, B4864, C1)
+        # C1 emit (CPU-silu fallback): PURE copy C1buf -> C1_out fifo slot.
+        # 3-arg shape (src, unused gs tile, dst) — the arg codegen for this
+        # shape is known-good in the aiecc (the silu's 3-arg call worked).
+        c1_emit = external_func("c1_emit", inputs=[C_ty, B4_ty, C_ty],
+                                link_with=kernel_o)
+        # zero_c1: zero the C1buf via a HARDCODED local address (0-arg — no
+        # arg setup the aiecc could drop; the generic zero_i32's target arg
+        # is not delivered reliably, issue #1837 — measured: C1 = garbage).
+        zero_c1 = external_func("zero_c1", inputs=[], link_with=kernel_o)
 
         tiles = [[tile(col, row) for col in range(n_aie_cols)] for row in range(2 + n_aie_rows)]
         shim_tiles, mem_tiles = tiles[0], tiles[1]
@@ -147,18 +156,22 @@ def my_fused_p1(M, K, N_GU, N_D, m, k, n, n_aie_cols=8, BATCH_SIZE=2):
         # scales + S_col ride the B stream (4096-B elements, first 512 B used)
         # — the core has only 2 input DMA channels.
 
-        # C1: GU accumulator — a TILE-LOCAL aie.buffer (not a fifo). The core
-        # tile has 2 input + 2 output DMA channels (A/B in, H2/C2 out); a
-        # produce-only C1 fifo would need a 3rd output channel
-        # ('aie.tile' op number of output DMA channel exceeded — measured).
+        # C1: the GU accumulator lives in the TILE-LOCAL C1buf — the matmul
+        # and zero target it with STATIC (symbol) addresses, the ONLY arg
+        # codegen verified bit-exact for the int4 GEMM (the aiecc's extern
+        # arg setup for runtime (fifo-acquire) pointers is broken — the
+        # first-call args / zero p0 are dropped or stale, issue #1837;
+        # measured: C1 = garbage when the matmul targets the fifo slot).
+        # The C1_out fifo (C1_C/C1_S) carries C1buf -> DDR (bo2) for the
+        # HOST to compute the silu (the CPU-silu fallback, issue #1769 —
+        # the on-core silu is mis-compiled by the aie2p backend, #1836).
         C1buf = [buffer(core_tiles[0][c], C_ty, name=f"C1_{c}")
                  for c in range(n_aie_cols)]
-        # dummy buffer for the silu's unused 2nd arg (passing C1buf twice
-        # broke the h2 writeback path in the aiecc — measured 2026-08-24)
+        # v1 debug buffers — Gg/Scol/Srow kept (allocator-layout stability);
+        # Btmp removed to fit C1buf + the C1_out fifo slot in the 64 KB core
+        # memory (measured: "allocated buffers exceeded available memory").
         Gg = [buffer(core_tiles[0][c], B_ty, name=f"Gg_{c}")
               for c in range(n_aie_cols)]
-        Btmp = [buffer(core_tiles[0][c], B_ty, name=f"Btmp_{c}")
-                for c in range(n_aie_cols)]
         Scol = [buffer(core_tiles[0][c], B_ty, name=f"Scol_{c}")
                 for c in range(n_aie_cols)]
         Srow = [buffer(core_tiles[0][c], B_ty, name=f"Srow_{c}")
@@ -167,11 +180,16 @@ def my_fused_p1(M, K, N_GU, N_D, m, k, n, n_aie_cols=8, BATCH_SIZE=2):
         # memory layout (the h2 writeback broke when they were removed).
 
         # h2: core → mem → shim → DDR (bo4). C2: core → mem → shim → DDR (bo2).
+        # C1_out fifos (issue #1769, CPU-silu fallback): the GU accumulator
+        # C1 (8x128 int32, 4 KB) is produced to DDR (bo2) and the HOST
+        # computes the silu (the on-core silu is mis-compiled by the aie2p
+        # backend — issue #1836). Uses the core's 2nd output channel (the
+        # p1 launch has no D phase, so the channel is free).
         H2_c = [None] * n_aie_cols; H2_s = [None] * n_aie_cols
         C2_c = [None] * n_aie_cols; C2_s = [None] * n_aie_cols
         for c in range(n_aie_cols):
-            H2_c[c] = object_fifo(f"H2_C{c}", core_tiles[0][c], mem_tiles[c], 1, H2_ty)  # DEPTH-1 TEST: single H2 slot
-            H2_s[c] = object_fifo(f"H2_S{c}", mem_tiles[c], shim_tiles[c], 1, H2_ty)
+            H2_c[c] = object_fifo(f"C1_C{c}", core_tiles[0][c], mem_tiles[c], 1, C_ty)
+            H2_s[c] = object_fifo(f"C1_S{c}", mem_tiles[c], shim_tiles[c], 1, C_ty)
             object_fifo_link(H2_c[c], H2_s[c])
 
         for j in range(n_aie_rows):
@@ -180,35 +198,30 @@ def my_fused_p1(M, K, N_GU, N_D, m, k, n, n_aie_cols=8, BATCH_SIZE=2):
                 def core_body():
                     for _ in range_(0xFFFFFFFF):
                         # ── GU phase: 4 col_groups ──
-                        # The gs' header tile rides the END of each col_group's
-                        # B stream ([gu 32][gs]) so its acquire/release is
-                        # strictly ordered. The 8-float section header (the
-                        # only reliably delivered bytes of the gs tile) is
-                        # identical for every (col, col_group).
+                        # Per col_group: zero the TILE-LOCAL C1buf (static
+                        # symbol arg — the only zero/matmul target with
+                        # verified arg codegen), accumulate all 32 K-chunks,
+                        # then emit C1buf -> the C1_out fifo slot (which the
+                        # runtime writes to DDR bo2). The gs tile (33rd B
+                        # object of the cg's stream) is consumed as the
+                        # emit's unused 2nd arg to keep the B fifo balanced.
                         for _ in range_(n_cg_gu):
-                            zero(C1buf[c])
+                            zero_c1()
                             for _ in range_(n_k):
                                 Abuf = A_c.acquire(ObjectFifoPort.Consume, 1)
                                 Bbuf = B_c[c].acquire(ObjectFifoPort.Consume, 1)
                                 matmul_i4(Abuf, Bbuf, C1buf[c])
                                 A_c.release(ObjectFifoPort.Consume, 1)
                                 B_c[c].release(ObjectFifoPort.Consume, 1)
-                            # ── SiLU + quant → h2 (row 0 valid; rows 1-7 zero) ──
-                            # v4: the fold S' rides in the LAST B tile (stashed
-                            # into C1 row 1 by matmul_i4). The gs fifo object
-                            # is acquired ONLY to keep the aiecc's 3-arg extern
-                            # call codegen healthy (it drops the arg setup for
-                            # 2-arg/plain-buffer-arg2 calls — measured
-                            # 2026-08-24); its (stale) data is unused.
                             Gsbuf = B_c[c].acquire(ObjectFifoPort.Consume, 1)  # gs tile (unused)
-                            H2buf = H2_c[c].acquire(ObjectFifoPort.Produce, 1)
-                            silu(C1buf[c], Gsbuf, H2buf)
+                            C1slot = H2_c[c].acquire(ObjectFifoPort.Produce, 1)
+                            c1_emit(C1buf[c], Gsbuf, C1slot)
                             H2_c[c].release(ObjectFifoPort.Produce, 1)
-                            B_c[c].release(ObjectFifoPort.Consume, 1)    # gs
+                            B_c[c].release(ObjectFifoPort.Consume, 1)          # gs
         @runtime_sequence(
             np.ndarray[(M * K,), np.dtype[dtype_in]],       # A   (bo0, residual)
             np.ndarray[(((K // 64) * (N_GU // 128)) * (8192),), np.dtype[dtype_in]],  # bo1: 5120-B per-tile chunks
-            np.ndarray[(M * N_D,), np.dtype[dtype_out]],    # C2  (bo2)
+            np.ndarray[(M * N_D * 2,), np.dtype[dtype_out]],  # C2 (bo2) 128 KB: P1 C1 writeback (32 chunks x 4 KB)
             np.ndarray[(K * N_D,), np.dtype[dtype_in]],     # B_d (bo3)
             np.ndarray[(M * K,), np.dtype[dtype_in]],       # H2  (bo4, scratch)
         )
@@ -220,9 +233,11 @@ def my_fused_p1(M, K, N_GU, N_D, m, k, n, n_aie_cols=8, BATCH_SIZE=2):
             # ── GU phase: 4 col_groups × (32 K-chunks + gs tile) ──
             # Per col_group the B stream is [gu 32 tiles][gs tile] — the gs
             # tile rides the END so the core's acquire/release stays strictly
-            # ordered (see core_body). The gs data is constant within a launch
-            # (the host rewrites the header once per token, not per col_group).
-            # NOTE: the gs + h2 writeback tasks are awaited PER col_group (not
+            # ordered: the core consumes it as the c1_emit's unused 2nd arg
+            # (33 consumes per col_group — the fifo stays balanced). Its data
+            # is unused — the per-token fold rides inside each B tile (region
+            # [4864, 5120) of the tile).
+            # NOTE: the C1 writeback tasks are awaited PER col_group (not
             # deferred to the end) — deferred awaits misalign the DMA token
             # order against the per-batch awaits and deadlock the launch
             # (measured: core stalls, C2 never written).
@@ -247,8 +262,8 @@ def my_fused_p1(M, K, N_GU, N_D, m, k, n, n_aie_cols=8, BATCH_SIZE=2):
                             dma_start_task(bt); bt_list.append(bt)
                     dma_await_task(*at_list, *bt_list)
                     dma_free_task(*at_list, *bt_list)
-                # gs' header tile (end of this cg's B stream): acquired ONLY
-                # to keep the aiecc's 3-arg extern call codegen healthy; its
+                # gs' header tile (end of this cg's B stream): consumed by the
+                # core as the c1_emit's unused 2nd arg (fifo balance); its
                 # (stale) data is unused — the fold rides in the B tiles.
                 gs_tasks = []
                 for c in range(n_aie_cols):
@@ -262,22 +277,15 @@ def my_fused_p1(M, K, N_GU, N_D, m, k, n, n_aie_cols=8, BATCH_SIZE=2):
                     dma_start_task(gt); gs_tasks.append(gt)
                 dma_await_task(*gs_tasks)
                 dma_free_task(*gs_tasks)
-                # h2 writeback per tile: chunk k = cg·8+c at bo4 offset 64k.
-                # The (8,64) h2 tile must land in bo4 in the A-layout
-                # (element (r,c') at r·K + (c'/8)·8 + c'%8) so the D-phase A
-                # read (the v27 A tap, strides [8K, 8, K, 1]) round-trips.
-                # The kernel's h2 fifo is row-major [8×64] (byte s = (r=s/64,
-                # c'=s%64)), so the writeback's middle strides are SWAPPED
-                # (row→K, col-group→8) vs the A-read tap — measured: the
-                # unswopped tap put (r,c') at 8r + 2048(c'/8) + c'%8 and the
-                # D GEMM's A operand was garbage (corr 0.374).
+                # C1 writeback per tile: chunk k = cg·8+c at bo2 offset
+                # k*4096 (the (8,128) int32 accumulator, contiguous).
                 h2_tasks = []
                 for c in range(n_aie_cols):
                     k_chunk = cg * n_aie_cols + c
                     ht = shim_dma_single_bd_task(
-                        H2_s[c], H2, offset=k_chunk * (n // 2),
-                        sizes=[m // 8, (n // 2) // 8, 8, 8],
-                        strides=[8 * K, K, 8, 1], issue_token=True)
+                        H2_s[c], C2, offset=k_chunk * (m * n * 4),
+                        sizes=[1, 1, 1, m * n * 4],
+                        strides=[1, 1, 1, 1], issue_token=True)
                     dma_start_task(ht); h2_tasks.append(ht)
                 dma_await_task(*h2_tasks)
                 dma_free_task(*h2_tasks)
