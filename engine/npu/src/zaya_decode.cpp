@@ -305,6 +305,34 @@ int zaya_decode_main(int argc, char** argv) {
                     fgu_bo[l][e] = fused_ctx.make_fused_weight_bo_i4(dev, d.H, 2 * m.n_ff);
                     fused_ctx.packB_into_fused_i4(*fgu_bo[l][e], raw_gu, e, d.H, m.n_ff,
                                                   fgu_cs[l][e], fgu_row[l][e]);
+                    if (getenv("NPU_C1_TEST") && l == 1) {
+                        // C1-layout test: override B'' = q4 = (GU col) mod 16
+                        // (nibbles = col-mod-16, ratio = 2^18 -> B'' = q4).
+                        // With the residual=1.0 (A=127) the C1[j] =
+                        // 127*2048*(j mod 16) = 260096*(j mod 16) — the
+                        // C1buf's positions reveal the true storage layout.
+                        uint8_t* Bm = (uint8_t*)fgu_bo[l][e]->map();
+                        const size_t n_tiles = (size_t)(d.H / 64) * ((2 * m.n_ff) / 128);
+                        for (size_t t = 0; t < n_tiles; t++) {
+                            uint8_t* tb = Bm + t * GuI4Pack::TILE_TOTAL;
+                            for (int i1 = 0; i1 < 16; i1++)
+                                for (int k = 0; k < 4; k++) {
+                                    int q0 = ((i1 * 8 + 2 * k) % 16);
+                                    int q1 = ((i1 * 8 + 2 * k + 1) % 16);
+                                    uint8_t b = (uint8_t)(q0 | (q1 << 4));
+                                    for (int i0 = 0; i0 < 8; i0++)
+                                        for (int i2 = 0; i2 < 8; i2++)
+                                            tb[i0 * 512 + i1 * 32 + i2 * 4 + k] = b;
+                                }
+                            for (int g = 0; g < 2; g++)
+                                for (int c = 0; c < 128; c++) {
+                                    int32_t rq = 1 << 18;
+                                    uint8_t* rp = tb + 5120 + g * 512 + c * 4;
+                                    memcpy(rp, &rq, 4);
+                                }
+                        }
+                        fgu_bo[l][e]->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                    }
                 } else {
                     fused_ctx.packB_into_fused(*fgu_bo[l][e], guI.data(), d.H, 2 * m.n_ff, fgu_cs[l][e], fgu_row[l][e]);
                 }
@@ -437,6 +465,9 @@ int zaya_decode_main(int argc, char** argv) {
                     // ── fused GU→SiLU→D: one launch ──
                     fused_ctx.group_scales[l] = fd_cs[l][e];
                     fused_ctx_p2.group_scales[l] = fd_cs[l][e];
+                    if (getenv("NPU_C1_TEST") && l == 1 && pos == 0) {
+                        for (int i = 0; i < d.H; i++) residual[i] = 1.0f;  // A = all-127
+                    }
                     float ag = dynamic_ascale(residual.data(), d.H);
                     fused_ctx.quantize_async(residual.data(), 1, d.H, ag);   // Am for the amax pass
                     float qn_s = zaya_moe::host_h2_amax_qn_s(
@@ -532,7 +563,10 @@ int zaya_decode_main(int argc, char** argv) {
                                     C1h[j] += (int32_t)Ai[i] * guBv2[(size_t)i * N2 + j];
                             const int32_t* c1m = fused_ctx.Cm;
                             fprintf(stderr, "[c1cmp] cpu: ");
-                            for (int j = 0; j < 8; j++) fprintf(stderr, "%d ", C1h[j]);
+                            if (getenv("NPU_C1_TEST"))
+                                for (int j = 0; j < 8; j++) fprintf(stderr, "%d ", 260096 * (j % 16));
+                            else
+                                for (int j = 0; j < 8; j++) fprintf(stderr, "%d ", C1h[j]);
                             fprintf(stderr, "\n[c1cmp] npu: ");
                             for (int j = 0; j < 8; j++) fprintf(stderr, "%d ", c1m[j]);
                             fprintf(stderr, "\n");
