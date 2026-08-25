@@ -500,6 +500,52 @@ int zaya_decode_main(int argc, char** argv) {
                                 C1h[j] += (int32_t)Am[i] * Bs[(size_t)i * (2 * m.n_ff) + j];
                         fprintf(stderr, "\n[c1host40] ");
                         for (int j = 0; j < 64; j++) fprintf(stderr, "%d ", (int)(C1h[2 * j] / 32));
+                        // v86: host unscaled C1 = Am . (q4*16) under 3 unpack-order
+                        // interpretations (nt=0, full K): NAT, INT (low nibbles first),
+                        // TRN (kk/cc swapped)
+                        {
+                            const uint8_t* Bm5 = (const uint8_t*)fgu_bo[l][e]->map();
+                            const int nt0 = 0;
+                            fprintf(stderr, "\n[c1unscNAT] ");
+                            fprintf(stderr, "\n[c1unscINT] ");
+                            fprintf(stderr, "\n[c1unscTRN] ");
+                            for (int c = 0; c < 128; c += 2) {
+                                long long aN = 0, aI = 0, aT = 0;
+                                for (int ki = 0; ki < 32; ki++)
+                                    for (int k = 0; k < 64; k++) {
+                                        int gk = ki * 64 + k;
+                                        size_t off = (size_t)(ki * 32 + nt0) * GuI4Pack::TILE_TOTAL
+                                            + (size_t)((k % 64) / 8) * 512 + (size_t)(c / 8) * 32
+                                            + (size_t)(k % 8) * 4 + (size_t)((c % 8) / 2);
+                                        int b = (int)Bm5[off];
+                                        int lo = b & 0x0F, hi = (b >> 4) & 0x0F;
+                                        if (lo >= 8) lo -= 16;
+                                        if (hi >= 8) hi -= 16;
+                                        int cc = c % 8, kk = k % 8;
+                                        // NAT: element (kk,cc) = byte kk*4+cc/2, nibble cc%2
+                                        int qN = (cc % 2 == 0) ? lo : hi;
+                                        // INT: element e = byte e%32, nibble e/32
+                                        //      e = kk*8+cc -> byte kk*4+cc/2, nibble (kk*8+cc)/32
+                                        int e = kk * 8 + cc;
+                                        int qI = (e / 32 == 0) ? lo : hi;
+                                        // TRN: element (kk,cc) = q4[cc][kk] -> byte cc*4+kk/2, nibble kk%2
+                                        size_t offT = (size_t)(ki * 32 + nt0) * GuI4Pack::TILE_TOTAL
+                                            + (size_t)((k % 64) / 8) * 512 + (size_t)(cc) * 32
+                                            + (size_t)((c / 8) % 8) * 4 + (size_t)((kk) / 2);
+                                        int bT = (int)Bm5[offT];
+                                        int loT = bT & 0x0F, hiT = (bT >> 4) & 0x0F;
+                                        if (loT >= 8) loT -= 16;
+                                        if (hiT >= 8) hiT -= 16;
+                                        int qT = (kk % 2 == 0) ? loT : hiT;
+                                        aN += (long long)fused_ctx.Am[gk] * (qN * 16);
+                                        aI += (long long)fused_ctx.Am[gk] * (qI * 16);
+                                        aT += (long long)fused_ctx.Am[gk] * (qT * 16);
+                                    }
+                                fprintf(stderr, "%lld %lld %lld ", (long long)(aN / 32),
+                                        (long long)(aI / 32), (long long)(aT / 32));
+                            }
+                            fprintf(stderr, "\n");
+                        }
                         {
                             const uint8_t* Bm2 = (const uint8_t*)fgu_bo[l][e]->map();
                             // kernel's call-2 nibble bytes: 176 16 243 251 209 238 5 239 at [X*8192 + k*4 + 1]
