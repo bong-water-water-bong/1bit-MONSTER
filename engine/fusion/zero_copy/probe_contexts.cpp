@@ -6,6 +6,11 @@
 // real cause of the EINVAL / context-exhaustion failure, or whether something
 // else is to blame.
 //
+// npu2 (Strix / Strix Halo / Krackan) HW context pool is 16, not 32 —
+// hwctx_limit in amdxdna npu4/npu5/npu6_regs.c (see Xilinx/mlir-aie #3526).
+// Probe defaults to 16 to match the hardware cap; a full sweep should see
+// ctx[16]: OK then ctx[17]: FAIL (MGMT_ERT_NOAVAIL / EINVAL).
+//
 // Build: g++ -std=c++20 -O2 probe_contexts.cpp -o probe_contexts \
 //          -I/usr/include/xrt -L/usr/lib/x86_64-linux-gnu -lxrt_coreutil -luuid -lpthread
 // Run:   sudo ./probe_contexts <xclbin> [max_contexts]
@@ -19,7 +24,7 @@
 int main(int argc, char** argv) {
     if (argc < 2) { fprintf(stderr, "usage: %s <xclbin> [max=8]\n", argv[0]); return 1; }
     const char* xp = argv[1];
-    int maxc = (argc > 2) ? atoi(argv[2]) : 8;
+    int maxc = (argc > 2) ? atoi(argv[2]) : 16;
 
     xrt::device dev(0);
     printf("device[0] opened; probing up to %d hw_contexts with %s\n", maxc, xp);
