@@ -257,7 +257,11 @@ endif()
 if(TARGET nlohmann_json)
     set(USE_SYSTEM_JSON ON)
 else()
+    if(TARGET nlohmann_json)
+    set(USE_SYSTEM_JSON ON)
+else()
     set(USE_SYSTEM_JSON ${nlohmann_json_FOUND})
+endif()
 endif()
 set(USE_SYSTEM_CURL ${CURL_FOUND})
 set(USE_SYSTEM_ZSTD ${ZSTD_FOUND})
@@ -265,7 +269,11 @@ set(USE_SYSTEM_CLI11 ${CLI11_INCLUDE_DIRS})
 if(TARGET httplib)
     set(USE_SYSTEM_HTTPLIB ON)
 else()
+    if(TARGET httplib)
+    set(USE_SYSTEM_HTTPLIB ON)
+else()
     set(USE_SYSTEM_HTTPLIB ${HTTPLIB_FOUND})
+endif()
 endif()
 set(USE_SYSTEM_LWS ${LWS_FOUND})
 
@@ -399,7 +407,7 @@ if(NOT USE_SYSTEM_CURL)
 endif()
 
 # === zstd ===
-if(NOT USE_SYSTEM_ZSTD)
+if(NOT USE_SYSTEM_ZSTD OR NOT TARGET zstd::libzstd)
     FetchContent_Declare(zstd
         GIT_REPOSITORY https://github.com/facebook/zstd.git
         GIT_TAG ac66b19e6bd6b83238bf008eecc1298105298532  # v1.5.7
@@ -1186,11 +1194,13 @@ endif()
 # and fatal on the parent's own add_test() calls. Only install the police
 # when testing is actually on.
 if(BUILD_TESTING)
-function(add_test)
-    message(FATAL_ERROR
-        "Direct add_test() is disabled in this project. Declare the test with "
-        "add_cpp_ci_test(<Name> CI <ON|OFF> COMMAND <...>) so its CI status is explicit.")
-endfunction()
+if(BUILD_TESTING)
+    function(add_test)
+        message(FATAL_ERROR
+            "Direct add_test() is disabled in this project. Declare the test with "
+            "add_cpp_ci_test(<Name> CI <ON|OFF> COMMAND <...>) so its CI status is explicit.")
+    endfunction()
+endif()
 endif()
 
 set(VLLM_ARG_RESOLVER_TEST_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/test/cpp/test_vllm_arg_resolver.cpp")

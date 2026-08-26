@@ -1159,7 +1159,7 @@ static int run_embedded_lemonade(int argc, char** argv) {
     lemon::configure_application_logging(config->log_level(),
                                          lemon::LoggingMode::direct_server);
 
-    lemon::Server server(config, cli_config.cache_dir);
+    lemon::Server server(config, cli_config.cache_dir, "");  // v11.8.0: ctor gained config_dir (empty = engine-controlled config)
     server.run();
     return 0;
 }
