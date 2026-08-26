@@ -904,3 +904,9 @@ extern "C" void unpack_i4_b(const int8_t *__restrict packed,
 }
 
 } // extern "C"
+
+extern "C" void c1_emit(const int32_t *src, const uint8_t *unused, int32_t *dst) {
+    const int32_t *s = (const int32_t *)0x7d000;
+    int32_t *d = (int32_t *)0x7c000;
+    for (unsigned i = 0; i < DIM_M * DIM_N; i++) d[i] = s[i];
+}
