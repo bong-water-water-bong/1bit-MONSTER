@@ -562,6 +562,22 @@ int zaya_decode_main(int argc, char** argv) {
                                 for (int i = 0; i < d.H; i++)
                                     C1h[j] += (int32_t)Ai[i] * guBv2[(size_t)i * N2 + j];
                             const int32_t* c1m = fused_ctx.Cm;
+                            {   // DIAG: host h2 (row 0) vs reference h2
+                                std::vector<float> fold2(2 * m.n_ff);
+                                for (int p = 0; p < m.n_ff; p++) {
+                                    fold2[2 * p]     = ag * fgu_cs[l][e][2 * p];
+                                    fold2[2 * p + 1] = ag * qn_s * fgu_cs[l][e][2 * p + 1];
+                                }
+                                std::vector<int8_t> h2r(m.n_ff), h2n(m.n_ff);
+                                silu_quant_i8(C1h.data(), fold2.data(), h2r.data(), m.n_ff);
+                                const int8_t* h2m2 = (const int8_t*)h2_bo[l]->map();
+                                for (int p = 0; p < 16; p++) h2n[p] = h2m2[(p >> 3) * 8 + (p & 7)];
+                                fprintf(stderr, "[h2ref] ");
+                                for (int p = 0; p < 16; p++) fprintf(stderr, "%d ", h2r[p]);
+                                fprintf(stderr, "\n[h2npu] ");
+                                for (int p = 0; p < 16; p++) fprintf(stderr, "%d ", h2n[p]);
+                                fprintf(stderr, "\n");
+                            }
                             fprintf(stderr, "[c1cmp] cpu: ");
                             if (getenv("NPU_C1_TEST"))
                                 for (int j = 0; j < 8; j++) fprintf(stderr, "%d ", 260096 * (j % 16));
@@ -570,9 +586,18 @@ int zaya_decode_main(int argc, char** argv) {
                             fprintf(stderr, "\n[c1cmp] npu: ");
                             for (int j = 0; j < 8; j++) fprintf(stderr, "%d ", c1m[j]);
                             fprintf(stderr, "\n");
+                            if (getenv("NPU_C1_TEST")) {
+                                FILE* f = fopen("/tmp/c1_layout.bin", "wb");
+                                fwrite(c1m, 4, 1024, f); fclose(f);
+                            }
                         }
                         fprintf(stderr, "[MoE L1 fused dbg] corr=%.6f maxdiff=%.6f (cpu rms=%.4f npu rms=%.4f) qn_s=%.4f\n",
                             num/std::sqrt(d1*d2), maxd, std::sqrt(d1/d.H), std::sqrt(d2/d.H), qn_s);
+                        fprintf(stderr, "[moecmp] cpu: ");
+                        for (int i = 0; i < 8; i++) fprintf(stderr, "%.4f ", cpu_out[i]);
+                        fprintf(stderr, "\n[moecmp] npu: ");
+                        for (int i = 0; i < 8; i++) fprintf(stderr, "%.4f ", moe_out[i]);
+                        fprintf(stderr, "\n");
                     }
                 } else {
                     gu_ctx.group_scales[l] = gu_cs[l][e];
