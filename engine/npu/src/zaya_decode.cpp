@@ -20,6 +20,7 @@
 #include "zaya_cca_attn_cpu.h"
 #include "zaya_moe_cpu.h"
 #include "npu_engine_i8ctx_inc.h"
+#include "npu_attn_ctx.h"
 
 #include <xrt/xrt_device.h>
 #include <xrt/xrt_bo.h>
@@ -254,8 +255,13 @@ int zaya_decode_main(int argc, char** argv) {
         // provides the cross-shim write->read visibility barrier the
         // single-launch design lacked (run-to-run nondeterminism at MoE
         // layers 3+; reproduced on strixhalo).
-        snprintf(fx, sizeof fx, "%s/final_i8_MOE_GUSILU_zaya.xclbin", xd);
-        snprintf(fi, sizeof fi, "%s/insts_i8_MOE_GUSILU_zaya.txt", xd);
+        if (FUSED_I4) {   // issue #1769 ws09: int4 GU (GUSILU) xclbin
+            snprintf(fx, sizeof fx, "%s/final_i8_MOE_GUSILU_i4_zaya.xclbin", xd);
+            snprintf(fi, sizeof fi, "%s/insts_i8_MOE_GUSILU_i4_zaya.txt", xd);
+        } else {
+            snprintf(fx, sizeof fx, "%s/final_i8_MOE_GUSILU_zaya.xclbin", xd);
+            snprintf(fi, sizeof fi, "%s/insts_i8_MOE_GUSILU_zaya.txt", xd);
+        }
         if (getenv("NPU_FUSED_XCLBIN")) snprintf(fx, sizeof fx, "%s", getenv("NPU_FUSED_XCLBIN"));
         if (getenv("NPU_FUSED_INSTS"))  snprintf(fi, sizeof fi, "%s", getenv("NPU_FUSED_INSTS"));
         if (!fused_ctx.init(dev, fx, fi, 0, NC)) { fprintf(stderr, "FUSED p1 ctx init failed\n"); return 1; }
@@ -311,6 +317,29 @@ int zaya_decode_main(int argc, char** argv) {
         }
         fprintf(stderr, "fused resident experts packed (%d experts x %d MoE layers)\n", m.n_exp, NC / 2);
     }
+
+    // ── Attention on NPU (issue #1776): NPU_ATTN=1 replaces the CPU GQA
+    // sequence-attention scan (QK^T + softmax + PV, O(seq) per token) with the
+    // hardware-verified flash-attention kernel (attn.xclbin, build_attn.sh).
+    // The q/k/v projections, cca_prep and o_proj stay on CPU (they are the
+    // next milestone — resident-weight int8 GEMMs + runlist). Falls back to
+    // the CPU scan when the flag is off or the xclbin is missing.
+    const bool NPU_ATTN = getenv("NPU_ATTN") && atoi(getenv("NPU_ATTN")) == 1;
+    const bool ATTN_DIAG = getenv("NPU_ATTN_DIAG") && atoi(getenv("NPU_ATTN_DIAG")) == 1;
+    AttnCtx attn_ctx;
+    if (NPU_ATTN) {
+        char ax[512], ai[512];
+        snprintf(ax, sizeof ax, "%s/attn.xclbin", xd);
+        snprintf(ai, sizeof ai, "%s/attn_insts.txt", xd);
+        if (getenv("NPU_ATTN_XCLBIN")) snprintf(ax, sizeof ax, "%s", getenv("NPU_ATTN_XCLBIN"));
+        if (getenv("NPU_ATTN_INSTS"))  snprintf(ai, sizeof ai, "%s", getenv("NPU_ATTN_INSTS"));
+        if (!attn_ctx.init(dev, ax, ai, d.nq, d.nkv, d.hd)) {
+            fprintf(stderr, "ATTN ctx init failed — falling back to CPU attention\n");
+        }
+    }
+    if (NPU_ATTN && attn_ctx.ready)
+        fprintf(stderr, "NPU attention ready (attn.xclbin, %d layers, MAX_SEQ=%d)\n",
+                NC / 2, attn_ctx.MAX_SEQ);
 
     // ── forward ──
     std::vector<std::vector<float>> kv_k(NC), kv_v(NC);
@@ -411,12 +440,47 @@ int zaya_decode_main(int argc, char** argv) {
                 int seq = (int)old + 1;
                 int gqa = d.nq / d.nkv;
                 std::vector<float> ao(qd);
-                for (int hh = 0; hh < d.nq; hh++) {
-                    int kv = hh / gqa;
-                    std::vector<float> sc(seq); float mx = -1e30f;
-                    for (int t = 0; t < seq; t++) { float s=0; const float* kt=&lk[(size_t)t*d.nkv*d.hd + kv*d.hd]; for (int dd=0;dd<d.hd;dd++) s+=qo[hh*d.hd+dd]*kt[dd]; s*=1.0f/sqrtf((float)d.hd); sc[t]=s; mx=std::max(mx,s); }
-                    float sm=0; for (int t=0;t<seq;t++){sc[t]=expf(sc[t]-mx);sm+=sc[t];}
-                    for (int dd=0;dd<d.hd;dd++){float a=0; for(int t=0;t<seq;t++)a+=sc[t]*lv[(size_t)t*d.nkv*d.hd+kv*d.hd+dd]; ao[hh*d.hd+dd]=a/(sm+1e-12f);}
+                // GQA sequence attention over the KV cache: CPU scan
+                // (fallback / diag reference) or the NPU flash-attention
+                // kernel (NPU_ATTN=1, issue #1776).
+                auto cpu_attn_scan = [&](std::vector<float>& aout) {
+                    for (int hh = 0; hh < d.nq; hh++) {
+                        int kv = hh / gqa;
+                        std::vector<float> sc(seq); float mx = -1e30f;
+                        for (int t = 0; t < seq; t++) { float s=0; const float* kt=&lk[(size_t)t*d.nkv*d.hd + kv*d.hd]; for (int dd=0;dd<d.hd;dd++) s+=qo[hh*d.hd+dd]*kt[dd]; s*=1.0f/sqrtf((float)d.hd); sc[t]=s; mx=std::max(mx,s); }
+                        float sm=0; for (int t=0;t<seq;t++){sc[t]=expf(sc[t]-mx);sm+=sc[t];}
+                        for (int dd=0;dd<d.hd;dd++){float a=0; for(int t=0;t<seq;t++)a+=sc[t]*lv[(size_t)t*d.nkv*d.hd+kv*d.hd+dd]; aout[hh*d.hd+dd]=a/(sm+1e-12f);}
+                    }
+                };
+                if (NPU_ATTN && attn_ctx.ready) {
+                    attn_ctx.run(qo.data(), lk.data(), lv.data(), seq, ao.data());
+                    if (ATTN_DIAG && l <= 4 && pos == 0) {
+                        // Per-layer accuracy probe: NPU ao vs the CPU float scan.
+                        std::vector<float> cpu_ao(qd);
+                        cpu_attn_scan(cpu_ao);
+                        double num=0, d1=0, d2=0; float maxd=0;
+                        for (int i = 0; i < qd; i++) {
+                            num += (double)cpu_ao[i]*ao[i]; d1 += (double)cpu_ao[i]*cpu_ao[i]; d2 += (double)ao[i]*ao[i];
+                            maxd = std::max(maxd, std::fabs(cpu_ao[i]-ao[i]));
+                        }
+                        fprintf(stderr, "[ATTN L%d dbg] corr=%.6f maxdiff=%.6f (cpu rms=%.4f npu rms=%.4f)\n", l,
+                                num/std::sqrt(d1*d2), maxd, std::sqrt(d1/qd), std::sqrt(d2/qd));
+                        if (getenv("NPU_ATTN_DIAG")) {
+                            for (int hh = 0; hh < d.nq; hh++) {
+                                double hn=0, h1=0, h2=0;
+                                for (int dd = 0; dd < d.hd; dd++) {
+                                    double x = cpu_ao[hh*d.hd+dd], y = ao[hh*d.hd+dd];
+                                    hn += x*y; h1 += x*x; h2 += y*y;
+                                }
+                                fprintf(stderr, "  [ATTN h%d] corr=%.4f ao[0..3]=%.3f %.3f %.3f %.3f cpu=%.3f %.3f %.3f %.3f\n",
+                                        hh, hn/std::sqrt(h1*h2),
+                                        ao[hh*d.hd+0], ao[hh*d.hd+1], ao[hh*d.hd+2], ao[hh*d.hd+3],
+                                        cpu_ao[hh*d.hd+0], cpu_ao[hh*d.hd+1], cpu_ao[hh*d.hd+2], cpu_ao[hh*d.hd+3]);
+                            }
+                        }
+                    }
+                } else {
+                    cpu_attn_scan(ao);
                 }
                 #pragma omp parallel for schedule(static)
                 for (int i = 0; i < H; i++) { float a=0; for (int j=0;j<qd;j++) a += w.cw.wo[i*qd+j]*ao[j]; h[i]=a; }
@@ -449,6 +513,135 @@ int zaya_decode_main(int argc, char** argv) {
                     // before the P2 D-phase MM2S read (shim[0]). The host
                     // sync forces the write path to drain.
                     h2_bo[l]->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+                    // DIAG (v63): kernel C1 (via c1 arg at gos) vs host C1h
+                    if (getenv("NPU_DIAG_H2") && l == 1 && pos == 0) {
+                        const int8_t* h2m = (const int8_t*)h2_bo[l]->map();
+                        fprintf(stderr, "[diagExp] expert=%d wt=%f\n", e, wt);
+                        fprintf(stderr, "[kernC1g64] ");
+                        for (int p = 0; p < 128; p++) fprintf(stderr, "%d ", (int)h2m[(p >> 3) * 8 + (p & 7)]);
+                        {
+                            const uint8_t* Bm = (const uint8_t*)fgu_bo[l][e]->map();
+                            fprintf(stderr, "\n[Am256] ");
+                            for (int j = 256; j < 288; j++) fprintf(stderr, "%d ", (int)fused_ctx.Am[j]);
+                            // search the whole BO for the kernel's call-1 first 4 bytes
+                            {
+                                int pat[4] = {209, 15, 33, 31};
+                                size_t bo_sz = gu_i4_bo_size(fused_ctx.KD, (int)(2 * m.n_ff));
+                                fprintf(stderr, "\n[boSearch] ");
+                                int found = 0;
+                                for (size_t j = 0; j + 4 < bo_sz && found < 4; j++) {
+                                    if (Bm[j] == pat[0] && Bm[j+1] == pat[1] && Bm[j+2] == pat[2] && Bm[j+3] == pat[3]) {
+                                        fprintf(stderr, "%zu ", j); found++;
+                                    }
+                                }
+                                fprintf(stderr, "(sz=%zu)\n", bo_sz);
+                            }
+                            fprintf(stderr, "\n[BOg0] ");
+                            for (int j = 5120; j < 5152; j++) fprintf(stderr, "%d ", (int)Bm[j]);
+                            fprintf(stderr, "\n[BOg1] ");
+                            for (int j = 5632; j < 5664; j++) fprintf(stderr, "%d ", (int)Bm[j]);
+                            fprintf(stderr, "\n[BO4096] ");
+                            for (int j = 4096; j < 4160; j++) fprintf(stderr, "%d ", (int)Bm[j]);
+                            fprintf(stderr, "\n[BO4608] ");
+                            for (int j = 4608; j < 4672; j++) fprintf(stderr, "%d ", (int)Bm[j]);
+                            fprintf(stderr, "\n[BO4864] ");
+                            for (int j = 4864; j < 4928; j++) fprintf(stderr, "%d ", (int)Bm[j]);
+                            fprintf(stderr, "\n[BO4928] ");
+                            for (int j = 4928; j < 5056; j++) fprintf(stderr, "%d ", (int)Bm[j]);
+                            fprintf(stderr, "\n");
+                        }
+                        // host C1h = Am · B_shadow (fgu_row)
+                        std::vector<int32_t> C1h(2 * (size_t)m.n_ff, 0);
+                        const int8_t* Am = fused_ctx.Am;
+                        const int8_t* Bs = fgu_row[l][e].data();
+                        for (size_t j = 0; j < 2 * (size_t)m.n_ff; j++)
+                            for (int i = 0; i < d.H; i++)
+                                C1h[j] += (int32_t)Am[i] * Bs[(size_t)i * (2 * m.n_ff) + j];
+                        fprintf(stderr, "\n[c1host40] ");
+                        for (int j = 0; j < 64; j++) fprintf(stderr, "%d ", (int)(C1h[2 * j] / 32));
+                        // v86: host unscaled C1 = Am . (q4*16) under 3 unpack-order
+                        // interpretations (nt=0, full K): NAT, INT (low nibbles first),
+                        // TRN (kk/cc swapped)
+                        {
+                            const uint8_t* Bm5 = (const uint8_t*)fgu_bo[l][e]->map();
+                            const int nt0 = 0;
+                            fprintf(stderr, "\n[c1unscNAT] ");
+                            fprintf(stderr, "\n[c1unscINT] ");
+                            fprintf(stderr, "\n[c1unscTRN] ");
+                            for (int c = 0; c < 128; c += 2) {
+                                long long aN = 0, aI = 0, aT = 0;
+                                for (int ki = 0; ki < 32; ki++)
+                                    for (int k = 0; k < 64; k++) {
+                                        int gk = ki * 64 + k;
+                                        size_t off = (size_t)(ki * 32 + nt0) * GuI4Pack::TILE_TOTAL
+                                            + (size_t)((k % 64) / 8) * 512 + (size_t)(c / 8) * 32
+                                            + (size_t)(k % 8) * 4 + (size_t)((c % 8) / 2);
+                                        int b = (int)Bm5[off];
+                                        int lo = b & 0x0F, hi = (b >> 4) & 0x0F;
+                                        if (lo >= 8) lo -= 16;
+                                        if (hi >= 8) hi -= 16;
+                                        int cc = c % 8, kk = k % 8;
+                                        // NAT: element (kk,cc) = byte kk*4+cc/2, nibble cc%2
+                                        int qN = (cc % 2 == 0) ? lo : hi;
+                                        // INT: element e = byte e%32, nibble e/32
+                                        //      e = kk*8+cc -> byte kk*4+cc/2, nibble (kk*8+cc)/32
+                                        int e = kk * 8 + cc;
+                                        int qI = (e / 32 == 0) ? lo : hi;
+                                        // TRN: element (kk,cc) = q4[cc][kk] -> byte cc*4+kk/2, nibble kk%2
+                                        size_t offT = (size_t)(ki * 32 + nt0) * GuI4Pack::TILE_TOTAL
+                                            + (size_t)((k % 64) / 8) * 512 + (size_t)(cc) * 32
+                                            + (size_t)((c / 8) % 8) * 4 + (size_t)((kk) / 2);
+                                        int bT = (int)Bm5[offT];
+                                        int loT = bT & 0x0F, hiT = (bT >> 4) & 0x0F;
+                                        if (loT >= 8) loT -= 16;
+                                        if (hiT >= 8) hiT -= 16;
+                                        int qT = (kk % 2 == 0) ? loT : hiT;
+                                        aN += (long long)fused_ctx.Am[gk] * (qN * 16);
+                                        aI += (long long)fused_ctx.Am[gk] * (qI * 16);
+                                        aT += (long long)fused_ctx.Am[gk] * (qT * 16);
+                                    }
+                                fprintf(stderr, "%lld %lld %lld ", (long long)(aN / 32),
+                                        (long long)(aI / 32), (long long)(aT / 32));
+                            }
+                            fprintf(stderr, "\n");
+                        }
+                        {
+                            const uint8_t* Bm2 = (const uint8_t*)fgu_bo[l][e]->map();
+                            // kernel's call-2 nibble bytes: 176 16 243 251 209 238 5 239 at [X*8192 + k*4 + 1]
+                            fprintf(stderr, "\n[searchNib2] ");
+                            int found = 0;
+                            for (int X = 0; X < 32 && found < 4; X++) {
+                                bool m = true;
+                                for (int k = 0; k < 8; k++) {
+                                    int v = (int)Bm2[(size_t)X * 32 * GuI4Pack::TILE_TOTAL + (size_t)k * 4 + 1];
+                                    int want = k == 0 ? 176 : (k==1 ? 16 : (k==2 ? 243 : (k==3 ? 251 : (k==4 ? 209 : (k==5 ? 238 : (k==6 ? 5 : 239))))));
+                                    if (v != want) { m = false; break; }
+                                }
+                                if (m) { fprintf(stderr, "ki=%d ", X); found++; }
+                            }
+                            fprintf(stderr, "\n");
+                        }
+                        fprintf(stderr, "\n[chunkC1c2] ");
+                        for (int nch = 0; nch < 32; nch++) {
+                            int32_t acc = 0;
+                            for (int i = nch * 64; i < (nch + 1) * 64; i++)
+                                acc += (int32_t)fused_ctx.Am[i] * Bs[(size_t)i * (2 * m.n_ff) + 2];
+                            fprintf(stderr, "%d ", (int)(acc / 32));
+                        }
+                        fprintf(stderr, "\n");
+                        fprintf(stderr, "\n[fullAm] ");
+                        for (int j = 0; j < 2048; j++) fprintf(stderr, "%d ", (int)fused_ctx.Am[j]);
+                        // per-chunk C1 col0 contributions (host, real Am)
+                        fprintf(stderr, "\n[chunkC1c0] ");
+                        for (int nch = 0; nch < 32; nch++) {
+                            int32_t acc = 0;
+                            for (int i = nch * 64; i < (nch + 1) * 64; i++)
+                                acc += (int32_t)fused_ctx.Am[i] * Bs[(size_t)i * (2 * m.n_ff) + 0];
+                            fprintf(stderr, "%d ", (int)(acc / 32));
+                        }
+                        fprintf(stderr, "\n");
+                        fprintf(stderr, "\n");
+                    }
                     // Force the coherent write path to drain: actually read a
                     // few h2 bytes host-side (the P1 S2MM writes go through
                     // the coherent host path; a sync alone can be a no-op for
@@ -470,33 +663,6 @@ int zaya_decode_main(int argc, char** argv) {
                                 std::chrono::duration<double, std::milli>(tb1 - tb0).count(),
                                 std::chrono::duration<double, std::milli>(tb2 - tb1).count(),
                                 std::chrono::duration<double, std::milli>(tb3 - tb2).count());
-                    if (getenv("NPU_FUSED_DBG") && l == 1 && pos == 0) {
-                        // ── minimal debug: h2 + host emulation comparison ──
-                        h2_bo[1]->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-                        fprintf(stderr, "  [fused-dbg Am] ");
-                        for (int i = 0; i < 8; i++) fprintf(stderr, "%d ", fused_ctx.Am[i]);
-                        fprintf(stderr, "\n  [fused-dbg guB k0 c0..15] ");
-                        const int8_t* wb = (const int8_t*)fgu_bo[l][e]->map();
-                        for (int i = 0; i < 16; i++) fprintf(stderr, "%d ", wb[i]);
-                        fprintf(stderr, "\n  [fused-dbg gsec-hdr(host)] ");
-                        const float* hb2 = (const float*)((const int8_t*)fgu_bo[l][e]->map() + (size_t)2048 * 4096);
-                        for (int i = 0; i < 8; i++) fprintf(stderr, "%.4e ", hb2[i]);
-                        fprintf(stderr, "\n");
-                                            // ── host emulation of the SAME fused path ──
-                        {
-                            std::vector<float> hout(d.H); float hqn = 0;
-                            std::vector<int8_t> guBv = fgu_row[l][e];
-                            std::vector<int8_t> dnBv = fd_row[l][e];
-                            zaya_moe::fused_ffn_int8(m, residual.data(), guBv, fgu_cs[l][e],
-                                                     dnBv, fd_cs[l][e], hout.data(), &hqn);
-                            double num=0, d1=0, d2=0;
-                            for (int i = 0; i < d.H; i++) {
-                                num += (double)hout[i]*moe_out[i]; d1 += (double)hout[i]*hout[i]; d2 += (double)moe_out[i]*moe_out[i];
-                            }
-                            fprintf(stderr, "  [fused-dbg] host-vs-NPU corr=%.6f (host rms=%.4f npu rms=%.4f) qn_s=%f hqn=%f\n",
-                                    num/std::sqrt(d1*d2), std::sqrt(d1/d.H), std::sqrt(d2/d.H), qn_s, hqn);
-                        }
-                    }
                     if (l == 1 && pos == 0) {
                         std::vector<float> cpu_out(d.H);
                         zaya_moe::expert_ffn(m, e, w.gu, w.dn, residual.data(), cpu_out.data());
