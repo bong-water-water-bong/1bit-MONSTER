@@ -684,17 +684,13 @@ extern "C" void matmul_i8_i32_i4(const int8_t *__restrict pA,
                                  const uint8_t *__restrict pB4,
                                  int32_t *__restrict pC) {
     constexpr unsigned nk = DIM_K / 8;    // 8 k-steps
-    constexpr unsigned nct = DIM_N / 8;   // 16 col-tiles... but the m8 kernel
-                                          // handles 4 col-tiles per pass; here
-                                          // DIM_N=128 -> 16; the fused design
-                                          // calls this per (64,128) tile -> 4.
+    constexpr unsigned nct = DIM_N / 8;   // 16 col-tiles
     // NOTE: the fused generator calls matmul ONCE per (A(8,64), B(64,128))
     // tile, so DIM_N=128 and this function processes the whole 128-wide tile
     // (16 col-tiles -> 4 passes of 4, mirroring matmul_vectorized_8x8x8_i8_i32_m8).
     using MMUL = aie::mmul<8, 8, 8, int8, int8, accauto>;
     event0();
 #ifdef I4_SCALAR_C1
-
 #ifdef I4_SUM_A
     // probe: C1 = sum of the A tile (64 values), same for every col — if the
     // A stream delivers Am correctly this stays small (~±800); if A arrives
@@ -707,13 +703,15 @@ extern "C" void matmul_i8_i32_i4(const int8_t *__restrict pA,
             pC[ci] = acc;
         }
     }
-    
+    event1();
+    return;
+#endif
+
     event1();
 #else
     // ── 1769 int4 mmul path (default, HEAD/1776): 4-accumulator m8
     //    with the silu_roundf no-libm fix; the v66 scalar (pi) is the
     //    I4_SCALAR_C1 fallback (aie2p C-store/ratio miscompiles, #1869).
-    event0();
     
     // 4 accumulators per col-tile group (C00..C03 pattern of the m8 kernel);
     // iterate col-tiles in groups of 4.
@@ -766,59 +764,7 @@ extern "C" void matmul_i8_i32_i4(const int8_t *__restrict pA,
     event1();
 #endif
 }
-            }
-        }
-    }
-    // v65: assemble the per-token silu metadata into C1 rows 1-4 from
-        // the CHUNKED [META_BASE..META_BASE+512) region of the k-tiles (the
-        // ONLY reliably-delivered tile region — the old pad at [6144..8192)
-        // was never delivered, so the v63 folds were stale). Each col_group's
-        // n_k = H/64 k-tiles carry a 512-B chunk; ki%4==0 -> foldG into C1
-        // row 1, ki%4==1 -> boundG into row 2, ki%4==2 -> boundU into row 3,
-        // ki%4==3 -> Q/shG/shU into row 4 cols 0-2. Only ki%4 is used, so
-        // the per-core static call counter (one matmul call per k-tile,
-        // strictly sequential per col_group) only needs n_k % 4 == 0 — the
-        // HOST GUARANTEES this (pack_gu_fused_i4 aborts otherwise; zaya1-8b
-        // has n_k = 32). The silu reads (st[go+8/+9/+16/+25], st[32..34])
-        // are pinned by the CPU gate's kernel-indexing emulation. C1buf is
-        // (8,128) int32 MICROTILED: element (r,c) at (c/8)*64 + r*8 + c%8,
-        // so row r col c = row-0 position + r*8.
-        {
-            static unsigned call = 0;
-            unsigned ki = call % 32;   // only ki%4 is used (== call%4 since 32%4==0)
-            const int32_t* mq = (const int32_t*)(pB4 + 5120);
 
-
-
-
-
-
-            if (ki % 4 == 3) {
-                pC[32] = mq[0];   // Q   (row 4 col 0)
-                pC[33] = mq[1];   // shG (row 4 col 1)
-                pC[34] = mq[2];   // shU (row 4 col 2)
-            }
-            if (ki % 4 <= 2) {
-                const unsigned rowoff = 8 + (ki % 4) * 8;   // row 1/2/3 col j
-                for (int j = 0; j < 128; j++) {
-                    unsigned p0 = (j / 8) * 64 + (j % 8);
-                    pC[p0 + rowoff] = mq[j];
-                }
-            }
-            call++;
-        }
-    event1();
-}
-
-// Zero the tile-local C1buf (HARDCODED local 0xE000 = C1_0, verified against
-// input_with_addresses.mlir — issue #1842) before each col_group's
-// accumulation. The generic zero_i32 takes its target as an arg, which the
-// aiecc does not deliver reliably (issue #1837 — the arg is emitted after the
-// call); the C1buf's boot content is nonzero, so an un-zeroed C1buf corrupts
-// the first matmul's accumulation (measured: C1 = garbage). 0-arg extern
-// calls have no arg setup the aiecc could drop. Each core's local address
-// space is private, so the same constant addresses each core's own C1buf
-// (the established hardcoded-address pattern — the silu's 0x7F000 h2 target).
 extern "C" void zero_c1(void) {
     int32_t *d = (int32_t *)0xE000;
     for (unsigned i = 0; i < DIM_M * DIM_N; i++) d[i] = 0;
