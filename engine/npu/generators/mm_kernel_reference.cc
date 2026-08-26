@@ -674,6 +674,12 @@ extern "C" void zero_i32(int32_t *c_out) {
 //
 // First cut: scalar dequant (correctness-first; vectorization = measured
 // optimization once the corr gate passes on NPU).
+// bring-up trace (issue #1769): first nibble bytes of the int4 B tile,
+// the dequantized B'' and the raw scale bytes the kernel read
+static uint8_t g_i4_trace_b[64];   // last matmul (ki=31) nibbles
+static uint8_t g_i4_trace_b0[64];  // first matmul (ki=0) nibbles
+static uint8_t g_i4_trace_dq[64];
+static uint8_t g_i4_trace_sc[32];
 extern "C" void matmul_i8_i32_i4(const int8_t *__restrict pA,
                                  const uint8_t *__restrict pB4,
                                  int32_t *__restrict pC) {
@@ -688,6 +694,7 @@ extern "C" void matmul_i8_i32_i4(const int8_t *__restrict pA,
     using MMUL = aie::mmul<8, 8, 8, int8, int8, accauto>;
     event0();
 #ifdef I4_SCALAR_C1
+
 #ifdef I4_SUM_A
     // probe: C1 = sum of the A tile (64 values), same for every col — if the
     // A stream delivers Am correctly this stays small (~±800); if A arrives
@@ -698,51 +705,16 @@ extern "C" void matmul_i8_i32_i4(const int8_t *__restrict pA,
         for (unsigned j = 0; j < DIM_N; j++) {
             unsigned ci = (j / 8) * 64 + (j % 8);
             pC[ci] = acc;
-#endif
-    // ── 1769 cpu-contract fallback: scalar row-0 C1 (preserved in the
-    //    consolidation — the mmul C-store was found scrambled in earlier
-    //    toolchain rounds; the row-0 scalar dot is layout-immune).
-// ── SCALAR row-0 C1 (issue #1769, CPU-silu fallback) ──
-    // The mmul-based accumulation's C-store comes out SCRAMBLED in this
-    // toolchain build (the C1buf holds the correct full-K dots of the cols
-    // =4-7 mod 8 at shifted positions, the other halves garbage — measured
-    // on hardware, rounds 2-3). The decode is M=1: only row 0 of the C1 is
-    // nonzero, so
-    //   C1[0][j] = sum_{k=0..63} A[0][k] * B''[k][j]
-    // per (64,128) tile — computed SCALAR (correctness-first; the row-0 dot
-    // is immune to the mmul C-layout). The A tile's row-0 is its first 64
-    // bytes (the A-layout (0,c) at (c/8)*8 + c%8 is contiguous within the
-    // tile); the C1 row-0 element (0, j) sits at (j/8)*64 + j%8 (the
-    // microtile layout, matching the verified C1buf).
-    for (unsigned i = 0; i < nk; ++i) {          // 8 k-steps
-        for (unsigned j = 0; j < nct; ++j) {     // 16 col-tiles
-            const uint8_t* nib = pB4 + i * 512 + j * 32;
-            const int32_t* rq = (const int32_t*)(pB4 + 5120 + (i / 4) * 512 + j * 32);
-            for (int e = 0; e < 64; e++) {
-                int k = e / 8, c = e % 8;
-                uint8_t b = nib[(e / 8) * 4 + (e % 8) / 2];
-                int q4 = (e % 2 == 0) ? (int)(b & 0x0F) : (int)((b >> 4) & 0x0F);
-                if (q4 >= 8) q4 -= 16;
-                int x = q4 * rq[e & 7];          // q4 * ratioQ22 (int32)
-                int ax = x < 0 ? -x : x;
-                int r = (ax + (1 << 17)) >> 18;  // round-half-away
-                r = x < 0 ? -r : r;
-                int8_t bv = (int8_t)(r > 127 ? 127 : r < -127 ? -127 : r);
-                int col = (int)j * 8 + c;
-                // A-layout (0, i*8+k) at the tap byte i*64+k: the row-0's
-                // k-cols of the i-th 8-col group sit at the 64-byte microtile
-                // strides ((c/8)*8 + c%8 is contiguous within each 8-col
-                // group, and the tap's linear byte order is (c%8) + 64*(c/8)).
-                pC[(col / 8) * 64 + (col % 8)] += (int32_t)pA[i * 64 + k] * (int32_t)bv;
-            }
         }
     }
+    
     event1();
 #else
-    // ── 1769 int4 mmul path (default): the 4-accumulator m8 pattern
-    //    with the silu_roundf no-libm fix (HEAD / 1776 branch).
-// ── 1769 int4 mmul path (default): the 4-accumulator m8 pattern
-//    with the silu_roundf no-libm fix (HEAD / 1776 branch).
+    // ── 1769 int4 mmul path (default, HEAD/1776): 4-accumulator m8
+    //    with the silu_roundf no-libm fix; the v66 scalar (pi) is the
+    //    I4_SCALAR_C1 fallback (aie2p C-store/ratio miscompiles, #1869).
+    event0();
+    
     // 4 accumulators per col-tile group (C00..C03 pattern of the m8 kernel);
     // iterate col-tiles in groups of 4.
     for (unsigned jg = 0; jg < nct; jg += 4) {
@@ -785,34 +757,70 @@ extern "C" void matmul_i8_i32_i4(const int8_t *__restrict pA,
             C02.mac(A0, B2);
             C03.mac(A0, B3);
         }
+        aie::store_v(pC1, C00.template to_vector<int32>());
+        aie::store_v(pC1 + 64, C01.template to_vector<int32>());
+        aie::store_v(pC1 + 128, C02.template to_vector<int32>());
+        aie::store_v(pC1 + 192, C03.template to_vector<int32>());
     }
     event1();
+    event1();
 #endif
+}
+            }
+        }
+    }
+    // v65: assemble the per-token silu metadata into C1 rows 1-4 from
+        // the CHUNKED [META_BASE..META_BASE+512) region of the k-tiles (the
+        // ONLY reliably-delivered tile region — the old pad at [6144..8192)
+        // was never delivered, so the v63 folds were stale). Each col_group's
+        // n_k = H/64 k-tiles carry a 512-B chunk; ki%4==0 -> foldG into C1
+        // row 1, ki%4==1 -> boundG into row 2, ki%4==2 -> boundU into row 3,
+        // ki%4==3 -> Q/shG/shU into row 4 cols 0-2. Only ki%4 is used, so
+        // the per-core static call counter (one matmul call per k-tile,
+        // strictly sequential per col_group) only needs n_k % 4 == 0 — the
+        // HOST GUARANTEES this (pack_gu_fused_i4 aborts otherwise; zaya1-8b
+        // has n_k = 32). The silu reads (st[go+8/+9/+16/+25], st[32..34])
+        // are pinned by the CPU gate's kernel-indexing emulation. C1buf is
+        // (8,128) int32 MICROTILED: element (r,c) at (c/8)*64 + r*8 + c%8,
+        // so row r col c = row-0 position + r*8.
+        {
+            static unsigned call = 0;
+            unsigned ki = call % 32;   // only ki%4 is used (== call%4 since 32%4==0)
+            const int32_t* mq = (const int32_t*)(pB4 + 5120);
 
-// CPU-silu fallback (issue #1769): the P1 kernel emits the VERIFIED C1 to the
-// C1_out fifo (bo2) so the HOST computes the silu (the on-core silu is
-// mis-compiled by the aie2p backend, issue #1836). A PURE int32 copy — no
-// float, no LUT, no memcpy — immune to the toolchain's mis-compiled loops.
-// The copy source/target are HARDCODED LOCAL addresses (0x7d000 = C1buf,
-// 0x7c000 = the C1_C0 fifo slot — this generator's basic-sequential
-// allocation, verified in the built core ELF): the aiecc's extern-call arg
-// setup is unreliable (issue #1837 — the 3rd arg is emitted AFTER the call),
-// so the args are ignored. Each core's local address space is private, so the
-// same constants address each core's own C1buf/fifo slot (the established
-// hardcoded-address pattern — the silu's 0x7F000 h2 target).
-extern "C" void c1_emit(const int32_t *src, const uint8_t *unused, int32_t *dst) {
-    const int32_t *s = (const int32_t *)0x7d000;
-    int32_t *d = (int32_t *)0x7c000;
-    for (unsigned i = 0; i < DIM_M * DIM_N; i++) d[i] = s[i];
+
+
+
+
+
+            if (ki % 4 == 3) {
+                pC[32] = mq[0];   // Q   (row 4 col 0)
+                pC[33] = mq[1];   // shG (row 4 col 1)
+                pC[34] = mq[2];   // shU (row 4 col 2)
+            }
+            if (ki % 4 <= 2) {
+                const unsigned rowoff = 8 + (ki % 4) * 8;   // row 1/2/3 col j
+                for (int j = 0; j < 128; j++) {
+                    unsigned p0 = (j / 8) * 64 + (j % 8);
+                    pC[p0 + rowoff] = mq[j];
+                }
+            }
+            call++;
+        }
+    event1();
 }
 
-// Zero the C1buf (HARDCODED local 0x7d000) before each col_group's
+// Zero the tile-local C1buf (HARDCODED local 0xE000 = C1_0, verified against
+// input_with_addresses.mlir — issue #1842) before each col_group's
 // accumulation. The generic zero_i32 takes its target as an arg, which the
-// aiecc does not deliver reliably (issue #1837 — the arg is emitted after
-// the call); the C1buf's boot content is nonzero, so an un-zeroed C1buf
-// corrupts the first matmul's accumulation (measured: C1 = garbage).
+// aiecc does not deliver reliably (issue #1837 — the arg is emitted after the
+// call); the C1buf's boot content is nonzero, so an un-zeroed C1buf corrupts
+// the first matmul's accumulation (measured: C1 = garbage). 0-arg extern
+// calls have no arg setup the aiecc could drop. Each core's local address
+// space is private, so the same constant addresses each core's own C1buf
+// (the established hardcoded-address pattern — the silu's 0x7F000 h2 target).
 extern "C" void zero_c1(void) {
-    int32_t *d = (int32_t *)0x7d000;
+    int32_t *d = (int32_t *)0xE000;
     for (unsigned i = 0; i < DIM_M * DIM_N; i++) d[i] = 0;
 }
 
@@ -858,122 +866,56 @@ extern "C" void silu_quant_i8_fused(int32_t *c1, const float *gs, int8_t *h2) {
 // raw Q4NX nibbles + on-chip dequant; the per-column int8 scales are finer
 // than the int8 path's per-section pack, so this silu is MORE accurate
 // (CPU gate: FFN corr 0.9996 vs 0.9978) at half the GU DMA.
-// v19: FIXED-POINT i4 silu (issue #1769) — pure integer math. The aie2p
-// backend mis-compiles the float silu loop (correct g/u inputs but wrong
-// h for some p — register clobbering across the software float libcalls).
-// This version uses Q32 fixed-point throughout: NO float libcalls.
-//   g = c1[go]·fold_gate (Q32); idx = round((clamp(g,-4,4)+4)·255/8);
-//   h = g·sigmoid(g)·u = slQ32·uQ32; h2 = sat8(round(h)).
-// The sigmoid LUT is Q32 over [-4, 4] (matches silu_quant.h's float LUT).
-static const int32_t silu_sigmoid_q32[256] = {
-    77250184, 79666469, 82156861, 84723539, 87368739, 90094760, 92903958, 95798752,
-    98781625, 101855123, 105021856, 108284502, 111645806, 115108581, 118675709, 122350144,
-    126134911, 130033107, 134047903, 138182543, 142440349, 146824717, 151339118, 155987103,
-    160772301, 165698417, 170769235, 175988621, 181360517, 186888945, 192578008, 198431885,
-    204454837, 210651202, 217025394, 223581908, 230325312, 237260250, 244391439, 251723670,
-    259261802, 267010764, 274975551, 283161221, 291572893, 300215747, 309095013, 318215975,
-    327583963, 337204352, 347082553, 357224011, 367634200, 378318615, 389282768, 400532181,
-    412072379, 423908883, 436047202, 448492823, 461251207, 474327775, 487727904, 501456910,
-    515520044, 529922479, 544669298, 559765482, 575215900, 591025296, 607198274, 623739288,
-    640652623, 657942388, 675612498, 693666657, 712108349, 730940816, 750167049, 769789768,
-    789811410, 810234110, 831059687, 852289628, 873925074, 895966803, 918415213, 941270312,
-    964531699, 988198554, 1012269620, 1036743193, 1061617108, 1086888730, 1112554941, 1138612129,
-    1165056183, 1191882480, 1219085884, 1246660734, 1274600845, 1302899504, 1331549464, 1360542951,
-    1389871657, 1419526751, 1449498879, 1479778168, 1510354240, 1541216215, 1572352726, 1603751931,
-    1635401525, 1667288760, 1699400457, 1731723031, 1764242509, 1796944552, 1829814480, 1862837292,
-    1895997702, 1929280155, 1962668865, 1996147837, 2029700902, 2063311747, 2096963944, 2130640984,
-    -2130640984, -2096963944, -2063311747, -2029700902, -1996147837, -1962668865, -1929280155, -1895997702,
-    -1862837292, -1829814480, -1796944552, -1764242509, -1731723031, -1699400457, -1667288760, -1635401525,
-    -1603751931, -1572352726, -1541216215, -1510354240, -1479778168, -1449498879, -1419526751, -1389871657,
-    -1360542951, -1331549464, -1302899504, -1274600845, -1246660734, -1219085884, -1191882480, -1165056183,
-    -1138612129, -1112554941, -1086888730, -1061617108, -1036743193, -1012269620, -988198554, -964531699,
-    -941270312, -918415213, -895966803, -873925074, -852289628, -831059687, -810234110, -789811410,
-    -769789768, -750167049, -730940816, -712108349, -693666657, -675612498, -657942388, -640652623,
-    -623739288, -607198274, -591025296, -575215900, -559765482, -544669298, -529922479, -515520044,
-    -501456910, -487727904, -474327775, -461251207, -448492823, -436047202, -423908883, -412072379,
-    -400532181, -389282768, -378318615, -367634200, -357224011, -347082553, -337204352, -327583963,
-    -318215975, -309095013, -300215747, -291572893, -283161221, -274975551, -267010764, -259261802,
-    -251723670, -244391439, -237260250, -230325312, -223581908, -217025394, -210651202, -204454837,
-    -198431885, -192578008, -186888945, -181360517, -175988621, -170769235, -165698417, -160772301,
-    -155987103, -151339118, -146824717, -142440349, -138182543, -134047903, -130033107, -126134911,
-    -122350144, -118675709, -115108581, -111645806, -108284502, -105021856, -101855123, -98781625,
-    -95798752, -92903958, -90094760, -87368739, -84723539, -82156861, -79666469, -77250184,
-};
-
-// fold float bits (bf16<<16) -> the float value as Q32 (value*2^32)
-static inline int64_t fold_q32(uint32_t bits) {
-    int e = (int)((bits >> 23) & 0xFF);
-    int64_t v = (int64_t)(0x800000 + (bits & 0x7FFFFF));
-    int sh = e - 118;   // (1+m/2^23)*2^(e-127) * 2^32 = (0x800000+m)*2^(e-118)
-    return sh >= 0 ? (v << sh) : (v >> (-sh));
-}
-
-
-// v50: Q22 sigmoid LUT over [-4, 4] (256 entries): round(sigmoid(-4+i*8/255)*2^22)
-static const int32_t silu_sigmoid_q22[256] = {
-    75440, 77799, 80231, 82738, 85321, 87983, 90727, 93553,
-    96466, 99468, 102560, 105747, 109029, 112411, 115894, 119483,
-    123179, 126985, 130906, 134944, 139102, 143384, 147792, 152331,
-    157004, 161815, 166767, 171864, 177110, 182509, 188064, 193781,
-    199663, 205714, 211939, 218342, 224927, 231699, 238664, 245824,
-    253185, 260753, 268531, 276525, 284739, 293179, 301851, 310758,
-    319906, 329301, 338948, 348852, 359018, 369452, 380159, 391145,
-    402414, 413974, 425827, 437981, 450441, 463211, 476297, 489704,
-    503438, 517502, 531904, 546646, 561734, 577173, 592967, 609120,
-    625637, 642522, 659778, 677409, 695418, 713809, 732585, 751748,
-    771300, 791244, 811582, 832314, 853442, 874968, 896890, 919209,
-    941925, 965038, 988545, 1012445, 1036735, 1061415, 1086479, 1111926,
-    1137750, 1163948, 1190514, 1217442, 1244727, 1272363, 1300341, 1328655,
-    1357297, 1386257, 1415526, 1445096, 1474955, 1505094, 1535501, 1566164,
-    1597072, 1628212, 1659571, 1691136, 1722893, 1754829, 1786928, 1819177,
-    1851560, 1884063, 1916669, 1949363, 1982130, 2014953, 2047816, 2080704,
-    2113600, 2146488, 2179351, 2212174, 2244941, 2277635, 2310241, 2342744,
-    2375127, 2407376, 2439475, 2471411, 2503168, 2534733, 2566092, 2597232,
-    2628140, 2658803, 2689210, 2719349, 2749208, 2778778, 2808047, 2837007,
-    2865649, 2893963, 2921941, 2949577, 2976862, 3003790, 3030356, 3056554,
-    3082378, 3107825, 3132889, 3157569, 3181859, 3205759, 3229266, 3252379,
-    3275095, 3297414, 3319336, 3340862, 3361990, 3382722, 3403060, 3423004,
-    3442556, 3461719, 3480495, 3498886, 3516895, 3534526, 3551782, 3568667,
-    3585184, 3601337, 3617131, 3632570, 3647658, 3662400, 3676802, 3690866,
-    3704600, 3718007, 3731093, 3743863, 3756323, 3768477, 3780330, 3791890,
-    3803159, 3814145, 3824852, 3835286, 3845452, 3855356, 3865003, 3874398,
-    3883546, 3892453, 3901125, 3909565, 3917779, 3925773, 3933551, 3941119,
-    3948480, 3955640, 3962605, 3969377, 3975962, 3982365, 3988590, 3994641,
-    4000523, 4006240, 4011795, 4017194, 4022440, 4027537, 4032489, 4037300,
-    4041973, 4046512, 4050920, 4055202, 4059360, 4063398, 4067319, 4071125,
-    4074821, 4078410, 4081893, 4085275, 4088557, 4091744, 4094836, 4097838,
-    4100751, 4103577, 4106321, 4108983, 4111566, 4114073, 4116505, 4118864,
-};
-
 extern "C" void silu_quant_i8_fused_i4(int32_t *c1, const float *gs, int8_t *h2) {
-    // v50: PURE int32 fixed-point silu — the aie2p backend mis-compiles the
-    // float loop (correct g/u, wrong h for p>=1) AND int64 math. The foldQ22
-    // is host-precomputed in the tile pad and stashed by the matmul at
-    // 0x76000; the h2 writeback target is the hardcoded H2 fifo slot 0x7F000
-    // (depth-1 fifo, identical on all cores).
+    // v59 (issue #1844): PURE int32 fixed-point silu — the aie2p backend
+    // mis-compiles the float loop (correct g/u, wrong h for p>=1 — #1836)
+    // AND int64 math (#1843). The v50/v51 Q22 version overflowed int32 for
+    // |g|>512 / |u|>512 (wrapped garbage + the reported "host h2=12 -> NPU 0"
+    // zero pairs) and zeroed the small per-column folds. This version reads
+    // the per-token silu metadata stashed by the last matmul at 0x6000:
+    //   [0..127]   foldG  (S'*2^Q int32, Q per tile from the tile MIN scale)
+    //   [128..255] boundG ((2^31-1)/|foldG| — c1g clamp, overflow-free)
+    //   [256..383] boundU (4*((2^31-1)/|foldG|)+3 — c1u clamp for uQ=(c1u>>2)*fold)
+    //   [384]      Q      (per-tile fold Q)
+    // The per-pair arithmetic lives in silu_quant.h (silu_pair_q22), CPU-
+    // gated bit-exactly by test_i4_silu_q22.cpp (corr 0.99997 vs the float
+    // silu_quant reference on realistic data). The h2 writeback target is
+    // the hardcoded H2 fifo slot 0x7F000 (depth-1 fifo, identical on all
+    // cores; wraps to the fifo @ 0xF000 — issue #1842).
     static const int gos[64] = {
         0, 2, 4, 6, 64, 66, 68, 70, 128, 130, 132, 134, 192, 194, 196, 198,
         256, 258, 260, 262, 320, 322, 324, 326, 384, 386, 388, 390, 448, 450, 452, 454,
         512, 514, 516, 518, 576, 578, 580, 582, 640, 642, 644, 646, 704, 706, 708, 710,
         768, 770, 772, 774, 832, 834, 836, 838, 896, 898, 900, 902, 960, 962, 964, 966 };
-    const int32_t *fold = (const int32_t *)0x6000;   // foldQ22 (the Gg_0 region)
+    // v65/v66: metadata from C1 rows 1-4 at the SAME microtile positions as
+    // the row-0 C1 dot (row r col c = row-0 pos + r*8), delivered via the c1
+    // ARG (the only reliable mechanism on this aie2p build — the 0x6000 stash
+    // was DCE'd). Per-pair reads (pinned by the CPU gate's kernel-indexing
+    // emulation in test_i4_silu_q22.cpp):
+    //   foldG[2p]     = c1[gos[p]+8]    (row 1, gate col)
+    //   foldG[2p+1]   = c1[gos[p]+9]    (row 1, up col)
+    //   boundG[2p]    = c1[gos[p]+16]   (row 2, gate col — clamps c1g)
+    //   boundU[2p+1]  = c1[gos[p]+25]   (row 3, UP col — clamps c1u; boundU
+    //                                    is per column (4·boundG[j]+3 for
+    //                                    foldu = foldG[2p+1]), so the UP
+    //                                    col's bound is 2p+1, NOT 2p — v66
+    //                                    fixes the v65 +24 off-by-one)
+    //   Q/shG/shU at c1[32..34] (row 4 cols 0-2).
+    const int32_t *st = c1;                                // C1buf (microtiled)
+    const int Q = st[32];                                  // per-tile fold Q
+    const int shG = st[33];                                // Q - 11 (host-precomputed)
+    const int shU = st[34];                                // Q - 7
     int8_t *h2w = (int8_t *)0x7F000;
     for (unsigned p = 0; p < DIM_N / 2; p++) {
         int go = gos[p];
-        int uo = gos[p] + 1;
-        int gQ22 = c1[go] * fold[2 * p];              // g * 2^22
-        int uQ22 = c1[uo] * fold[2 * p + 1];          // u * 2^22
-        if (gQ22 < -(1 << 24)) gQ22 = -(1 << 24);
-        else if (gQ22 > (1 << 24)) gQ22 = (1 << 24);
-        int idx = ((((gQ22 + (1 << 24)) >> 8) * 255) + (1 << 16)) >> 17;
-        if (idx < 0) idx = 0;
-        else if (idx > 255) idx = 255;
-        int gLUTQ22 = (gQ22 >> 11) * (silu_sigmoid_q22[idx] >> 11);
-        int hQ12 = (gLUTQ22 >> 16) * (uQ22 >> 16);    // == h*2^12
-        int ha = hQ12 < 0 ? -hQ12 : hQ12;
-        int h = (ha + (1 << 11)) >> 12;               // round-half-away
-        h = hQ12 < 0 ? -h : h;
-        h2w[p] = silu_sat8(h);
+#ifdef NPU_C1_DUMP
+        h2w[p] = (int8_t)(c1[gos[p]] >> 5);   // C1 gate col 2p (full-K dot)
+#else
+        h2w[p] = silu_pair_q22(c1[go], c1[go + 1],
+                               st[go + 8], st[go + 9],        // foldg, foldu (row 1)
+                               st[go + 16], st[go + 25],      // boundg (row 2), boundu (row 3, UP col)
+                               Q, shG, shU);
+#endif
     }
     for (unsigned i = DIM_N / 2; i < DIM_M * (DIM_N / 2); i++) h2w[i] = 0;
 }

@@ -10,7 +10,7 @@ mkdir -p "$W"; trap 'rm -rf "$W"' EXIT
 
 # kernel: matmul + silu + unpack + dequant in one object
 $P/bin/clang++ --target=aie2p-none-unknown-elf --std=c++20 -O2 \
-    -DDIM_M=8 -DDIM_K=64 -DDIM_N=128 -Di8_i32_ONLY -DM8_VECTORIZED \
+    -DDIM_M=8 -DDIM_K=64 -DDIM_N=128 -Di8_i32_ONLY -DM8_VECTORIZED -DNPU_C1_DUMP \
     -isystem $P/include/c++/v1 \
     -I /home/bcloud/Xilinx/2025.2/Vitis/aietools/include \
     -I $M/include/aie_kernels/aie2p \
