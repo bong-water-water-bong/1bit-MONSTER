@@ -40,6 +40,11 @@ void gemm_generate_sequence_i8(
 
 struct I8Ctx {
     int MD, KD, ND, NL;
+    int bC_nd = 0;   // bo2 (C2) size override: MD*bC_nd*4 bytes when > 0.
+                     // The int4 P1 launch writes the FULL C1 (32 chunks x
+                     // 4 KB = 128 KB) to bo2 (issue #1769 CPU-silu fallback),
+                     // while ND is the logical D output width (2048) — set
+                     // bC_nd = 2*n_ff (4096) so the writeback fits.
     std::unique_ptr<xrt::xclbin> xc;
     std::unique_ptr<xrt::hw_context> hc;
     std::unique_ptr<xrt::kernel> k;
@@ -201,8 +206,9 @@ struct I8Ctx {
         fprintf(stderr, "  creating bA size=%zu (MD=%d KD=%d)\n", (size_t)MD * KD, MD, KD);
         bA = std::make_unique<xrt::bo>(d, (size_t)MD * KD,
                                        XRT_BO_FLAGS_HOST_ONLY, grp_a);
-        fprintf(stderr, "  creating bC size=%zu (MD=%d ND=%d)\n", (size_t)MD * ND * 4, MD, ND);
-        bC = std::make_unique<xrt::bo>(d, (size_t)MD * ND * 4,
+        size_t bc_bytes = bC_nd > 0 ? (size_t)MD * bC_nd * 4 : (size_t)MD * ND * 4;
+        fprintf(stderr, "  creating bC size=%zu (MD=%d ND=%d bC_nd=%d)\n", bc_bytes, MD, ND, bC_nd);
+        bC = std::make_unique<xrt::bo>(d, bc_bytes,
                                        XRT_BO_FLAGS_HOST_ONLY, grp_c);
         Am = (int8_t*)bA->map();
         Cm = (int32_t*)bC->map();
@@ -797,13 +803,55 @@ struct I8Ctx {
     // kernel's silu stage reads S'[j] per column instead of gs[0]/gs[4].
     void update_fused_header_i4(xrt::bo& bo, const std::vector<float>& scol,
                                 int n_ff, float ag, float qn_s, int N) {
-        size_t a = (size_t)KD * N / 2 + (size_t)(KD / 32) * N * 2;  // regions A+B
-        float* dst = (float*)((uint8_t*)bo.map() + a + (size_t)N * 2);
-        for (int p = 0; p < n_ff; p++) {
-            dst[2 * p]     = ag * scol[2 * p];
-            dst[2 * p + 1] = ag * qn_s * scol[2 * p + 1];
+        // v3 per-tile BO (gu_i4_pack.h, TILE_TOTAL 5120): the per-token fold
+        // S' rides INSIDE each 5120-B tile at [4864, 5120) as 128 bf16
+        // (S'[p] = ag*S_col[p] for gate cols, ag*qn_s*S_col[p] for up cols).
+        // The kernel's matmul stashes the tile's fold into C1 row 1 for the
+        // silu — NO gs tile in the B stream (the 33rd B object per col_group
+        // never delivered — stale fold, measured 2026-08-24). Tile (ki, nt)
+        // covers GU cols [nt*128, nt*128+128); the host rewrites the fold
+        // region of every tile (redundant but keeps the DMA streams uniform).
+        const size_t n_tiles = gu_i4_bo_size(KD, N) / GuI4Pack::TILE_TOTAL;
+        const int n_tiles_n = N / 128;
+        uint8_t* Bm = (uint8_t*)bo.map();
+        for (size_t t = 0; t < n_tiles; t++) {
+            int nt = (int)(t % (size_t)n_tiles_n);
+            uint8_t* fb = Bm + t * GuI4Pack::TILE_TOTAL + 4096 + 512 + 256;
+            // v38: the silu's fold also precomputed as int32 Q22 in the tile
+            // PAD [6656 + j*4] (= round(S'*2^22)) — the aie2p backend
+            // mis-compiles the float silu loop AND int64 math, so the silu
+            // is pure int32 fixed-point.
+            uint8_t* fq = Bm + t * GuI4Pack::TILE_TOTAL + 6656;
+            for (int j = 0; j < 128; j++) {
+                int p = nt * 128 + j;                  // GU col
+                float sv = (p & 1) ? ag * qn_s * scol[p] : ag * scol[p];
+                uint16_t b = f32_to_bf16_impl(sv);
+                fb[2 * j]     = (uint8_t)(b & 0xFF);
+                fb[2 * j + 1] = (uint8_t)(b >> 8);
+                int32_t q = (int32_t)std::roundf(sv * 4194304.0f);   // Q22
+                fq[4 * j]     = (uint8_t)(q & 0xFF);
+                fq[4 * j + 1] = (uint8_t)((q >> 8) & 0xFF);
+                fq[4 * j + 2] = (uint8_t)((q >> 16) & 0xFF);
+                fq[4 * j + 3] = (uint8_t)((q >> 24) & 0xFF);
+            }
+            // v48: SECTION scales for the working int8-silu fallback: the
+            // per-cg section max S_col, folded as gs[0]=ag*gsec / gs[4]=
+            // ag*qn_s*gsec (float bits) at [7168..7184). Tile (ki, nt) with
+            // nt = cg*8+c belongs to GU section cg = nt/8.
+            {
+                int cg = nt / 8;
+                float gsec = 0;
+                for (int cc = cg * 1024; cc < cg * 1024 + 1024; cc++)
+                    gsec = std::max(gsec, scol[(size_t)cc]);
+                float v0 = ag * gsec;
+                float v4 = ag * qn_s * gsec;
+                uint8_t* sg = Bm + t * GuI4Pack::TILE_TOTAL + 7168;
+                memcpy(sg + 0, &v0, 4);
+                memcpy(sg + 16, &v4, 4);
+            }
         }
-        bo.sync(XCL_BO_SYNC_BO_TO_DEVICE, (size_t)N * 4, a + (size_t)N * 2);
+        bo.sync(XCL_BO_SYNC_BO_TO_DEVICE,
+                (size_t)gu_i4_bo_size(KD, N), 0);
     }
 
     // Fused D weights: per-column quant (like packB_into) but tile-contiguous

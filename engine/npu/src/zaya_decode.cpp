@@ -365,6 +365,10 @@ int zaya_decode_main(int argc, char** argv) {
     std::vector<std::unique_ptr<xrt::bo>> h2_bo(NC);  // per-MoE-layer scratch (issue #1775 hang probe)
     if (FUSED) {
         fused_ctx.MD = 8; fused_ctx.KD = d.H; fused_ctx.ND = d.H;
+        // The int4 P1 kernel writes the FULL C1 (32 chunks x 4 KB = 128 KB)
+        // to bo2 (CPU-silu fallback, issue #1769) while ND is the D output
+        // width (2048) — enlarge bC via bC_nd (npu_engine_i8ctx_inc.h).
+        fused_ctx.bC_nd = 2 * m.n_ff;
         char fx[512], fi[512];
         // Split launch (issue #1775): p1 = GU->SiLU->h2 writeback, p2 = D
         // reading h2 from bo4. A host-side h2_bo sync between the launches
@@ -418,6 +422,34 @@ int zaya_decode_main(int argc, char** argv) {
                     fgu_bo[l][e] = fused_ctx.make_fused_weight_bo_i4(dev, d.H, 2 * m.n_ff);
                     fused_ctx.packB_into_fused_i4(*fgu_bo[l][e], raw_gu, e, d.H, m.n_ff,
                                                   fgu_cs[l][e], fgu_row[l][e]);
+                    if (getenv("NPU_C1_TEST") && l == 1) {
+                        // C1-layout test: override B'' = q4 = (GU col) mod 16
+                        // (nibbles = col-mod-16, ratio = 2^18 -> B'' = q4).
+                        // With the residual=1.0 (A=127) the C1[j] =
+                        // 127*2048*(j mod 16) = 260096*(j mod 16) — the
+                        // C1buf's positions reveal the true storage layout.
+                        uint8_t* Bm = (uint8_t*)fgu_bo[l][e]->map();
+                        const size_t n_tiles = (size_t)(d.H / 64) * ((2 * m.n_ff) / 128);
+                        for (size_t t = 0; t < n_tiles; t++) {
+                            uint8_t* tb = Bm + t * GuI4Pack::TILE_TOTAL;
+                            for (int i1 = 0; i1 < 16; i1++)
+                                for (int k = 0; k < 4; k++) {
+                                    int q0 = ((i1 * 8 + 2 * k) % 16);
+                                    int q1 = ((i1 * 8 + 2 * k + 1) % 16);
+                                    uint8_t b = (uint8_t)(q0 | (q1 << 4));
+                                    for (int i0 = 0; i0 < 8; i0++)
+                                        for (int i2 = 0; i2 < 8; i2++)
+                                            tb[i0 * 512 + i1 * 32 + i2 * 4 + k] = b;
+                                }
+                            for (int g = 0; g < 2; g++)
+                                for (int c = 0; c < 128; c++) {
+                                    int32_t rq = 1 << 18;
+                                    uint8_t* rp = tb + 5120 + g * 512 + c * 4;
+                                    memcpy(rp, &rq, 4);
+                                }
+                        }
+                        fgu_bo[l][e]->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                    }
                 } else {
                     fused_ctx.packB_into_fused(*fgu_bo[l][e], guI.data(), d.H, 2 * m.n_ff, fgu_cs[l][e], fgu_row[l][e]);
                 }
@@ -713,6 +745,9 @@ int zaya_decode_main(int argc, char** argv) {
                     // ── fused GU→SiLU→D: one launch ──
                     fused_ctx.group_scales[l] = fd_cs[l][e];
                     fused_ctx_p2.group_scales[l] = fd_cs[l][e];
+                    if (getenv("NPU_C1_TEST") && l == 1 && pos == 0) {
+                        for (int i = 0; i < d.H; i++) residual[i] = 1.0f;  // A = all-127
+                    }
                     float ag = dynamic_ascale(residual.data(), d.H);
                     fused_ctx.quantize_async(residual.data(), 1, d.H, ag);   // Am for the amax pass
                     float qn_s = zaya_moe::host_h2_amax_qn_s(
@@ -724,7 +759,11 @@ int zaya_decode_main(int argc, char** argv) {
                     else
                         fused_ctx.update_fused_header(*fgu_bo[l][e], fgu_cs[l][e], m.n_ff, ag, qn_s, 2 * m.n_ff);
                     auto tb1 = std::chrono::steady_clock::now();
-                    // P1: GU->SiLU->h2 writeback.
+                    // P1: GU GEMM → C1 writeback to bo2 (the CPU-silu
+                    // fallback, issue #1769/#1836: the on-core silu is
+                    // mis-compiled by the aie2p backend, so the P1 kernel
+                    // only writes the C1 — 32 chunks x 4 KB — and the HOST
+                    // computes the silu from the verified bit-exact C1).
                     auto frun = fused_ctx.launch_fused(*fgu_bo[l][e], *fd_bo[l][e], *h2_bo[l],
                                                        residual.data(), 1, d.H, ag);
                     auto tb2 = std::chrono::steady_clock::now();
@@ -867,12 +906,39 @@ int zaya_decode_main(int argc, char** argv) {
                     // few h2 bytes host-side (the P1 S2MM writes go through
                     // the coherent host path; a sync alone can be a no-op for
                     // HOST_ONLY BOs, but a real read must observe the data).
-                    {
-                        const volatile int8_t* h2m =
-                            (const volatile int8_t*)h2_bo[l]->map();
-                        volatile int sink = 0;
-                        for (int i = 0; i < 64; i++) sink += h2m[i];
-                        (void)sink;
+                    // 1769 cpu-contract CPU-silu fallback (consolidation): the on-core
+                    // silu is mis-compiled by this aie2p build (#1836), so with
+                    // NPU_FUSED_I4_CPUSILU=1 the host reads the kernel's C1_out (via
+                    // c1_emit) and computes h2 (silu_quant.h) into bo4 for the D read.
+                    if (FUSED_I4 && getenv("NPU_FUSED_I4_CPUSILU") && atoi(getenv("NPU_FUSED_I4_CPUSILU")) == 1) {
+                        {
+                        fused_ctx.bC->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+                        const int32_t* c1m = fused_ctx.Cm;
+                        const int H2n = m.n_ff;                     // 2048
+                        const std::vector<float>& scol = fgu_cs[l][e];  // S_col
+                        std::vector<float> fold(2 * H2n);           // S' per GU col
+                        for (int p = 0; p < H2n; p++) {
+                            fold[2 * p]     = ag * scol[2 * p];          // gate
+                            fold[2 * p + 1] = ag * qn_s * scol[2 * p + 1]; // up
+                        }
+                        int8_t* h2m = (int8_t*)h2_bo[l]->map();
+                        std::vector<int32_t> C1row(2 * H2n);
+                        std::vector<int8_t> h2row(H2n);
+                        for (int r = 0; r < 8; r++) {
+                            // Microtiled C1: element (r, c) of chunk kc at
+                            // kc·1024 + (c/8)·64 + r·8 + (c%8) → row-major.
+                            for (int p = 0; p < H2n; p++) {
+                                for (int t = 0; t < 2; t++) {
+                                    int j = 2 * p + t, kc = j >> 7, c = j & 127;
+                                    C1row[j] = c1m[kc * 1024 + (c >> 3) * 64 + r * 8 + (c & 7)];
+                                }
+                            }
+                            silu_quant_i8(C1row.data(), fold.data(), h2row.data(), H2n);
+                            for (int p = 0; p < H2n; p++)
+                                h2m[(size_t)r * H2n + (p >> 3) * 8 + (p & 7)] = h2row[p];
+                        }
+                        h2_bo[l]->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                    }
                     }
                     // P2: D GEMM reading h2 from bo4.
                     auto frun2 = fused_ctx_p2.launch_fused(*fgu_bo[l][e], *fd_bo[l][e], *h2_bo[l],
@@ -892,8 +958,61 @@ int zaya_decode_main(int argc, char** argv) {
                             num += (double)cpu_out[i]*moe_out[i]; d1 += (double)cpu_out[i]*cpu_out[i]; d2 += (double)moe_out[i]*moe_out[i];
                             maxd = std::max(maxd, std::fabs(cpu_out[i]-moe_out[i]));
                         }
+                        {
+                            // CPU-silu fallback probe: the P1 C1 readback
+                            // (chunk 0, row 0 = GU cols 0..7) vs the CPU
+                            // reference C1h from the int8 shadow.
+                            float ag2 = 0;
+                            for (int i = 0; i < d.H; i++) ag2 = std::max(ag2, std::fabs(residual[i]));
+                            ag2 = ag2 < 1e-12f ? 1.0f : ag2 / 127.0f;
+                            std::vector<int8_t> Ai(d.H);
+                            for (int i = 0; i < d.H; i++) {
+                                int x = (int)std::roundf(residual[i] / ag2);
+                                Ai[i] = (int8_t)(x > 127 ? 127 : x < -127 ? -127 : x);
+                            }
+                            const int N2 = 2 * m.n_ff;
+                            std::vector<int32_t> C1h(N2, 0);
+                            const std::vector<int8_t>& guBv2 = fgu_row[l][e];
+                            for (int j = 0; j < N2; j++)
+                                for (int i = 0; i < d.H; i++)
+                                    C1h[j] += (int32_t)Ai[i] * guBv2[(size_t)i * N2 + j];
+                            const int32_t* c1m = fused_ctx.Cm;
+                            {   // DIAG: host h2 (row 0) vs reference h2
+                                std::vector<float> fold2(2 * m.n_ff);
+                                for (int p = 0; p < m.n_ff; p++) {
+                                    fold2[2 * p]     = ag * fgu_cs[l][e][2 * p];
+                                    fold2[2 * p + 1] = ag * qn_s * fgu_cs[l][e][2 * p + 1];
+                                }
+                                std::vector<int8_t> h2r(m.n_ff), h2n(m.n_ff);
+                                silu_quant_i8(C1h.data(), fold2.data(), h2r.data(), m.n_ff);
+                                const int8_t* h2m2 = (const int8_t*)h2_bo[l]->map();
+                                for (int p = 0; p < 16; p++) h2n[p] = h2m2[(p >> 3) * 8 + (p & 7)];
+                                fprintf(stderr, "[h2ref] ");
+                                for (int p = 0; p < 16; p++) fprintf(stderr, "%d ", h2r[p]);
+                                fprintf(stderr, "\n[h2npu] ");
+                                for (int p = 0; p < 16; p++) fprintf(stderr, "%d ", h2n[p]);
+                                fprintf(stderr, "\n");
+                            }
+                            fprintf(stderr, "[c1cmp] cpu: ");
+                            if (getenv("NPU_C1_TEST"))
+                                for (int j = 0; j < 8; j++) fprintf(stderr, "%d ", 260096 * (j % 16));
+                            else
+                                for (int j = 0; j < 8; j++) fprintf(stderr, "%d ", C1h[j]);
+                            fprintf(stderr, "\n[c1cmp] npu: ");
+                            for (int j = 0; j < 8; j++) fprintf(stderr, "%d ", c1m[j]);
+                            fprintf(stderr, "\n");
+                            if (getenv("NPU_C1_TEST")) {
+                                FILE* f = fopen("/tmp/c1_layout.bin", "wb");
+                                fwrite(c1m, 4, 1024, f); fclose(f);
+                            }
+                        }
                         fprintf(stderr, "[MoE L1 fused dbg] corr=%.6f maxdiff=%.6f (cpu rms=%.4f npu rms=%.4f) qn_s=%.4f\n",
                             num/std::sqrt(d1*d2), maxd, std::sqrt(d1/d.H), std::sqrt(d2/d.H), qn_s);
+                        fprintf(stderr, "[moecmp] cpu: ");
+                        for (int i = 0; i < 8; i++) fprintf(stderr, "%.4f ", cpu_out[i]);
+                        fprintf(stderr, "\n[moecmp] npu: ");
+                        for (int i = 0; i < 8; i++) fprintf(stderr, "%.4f ", moe_out[i]);
+                        fprintf(stderr, "\n");
                     }
                 } else {
                     gu_ctx.group_scales[l] = gu_cs[l][e];
