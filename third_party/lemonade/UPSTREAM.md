@@ -15,6 +15,26 @@ git checkout 2b6a7d77c71e551736f6cc8473dc46f479cd156b  # v11.7.0
 rsync -a --exclude=.git /tmp/lemonade/ third_party/lemonade/
 ```
 
+
+## Local patch: embedded dependency compatibility (v11.8.0 additions)
+
+Beyond the embeddability patch above, v11.8.0's CMakeLists needs three more
+local edits to build as a subdirectory of the 1bit engine (all no-op or
+inert when built standalone):
+
+1. **Existing-target detection for deps**: `find_package(nlohmann_json)` /
+   `pkg_check_modules(HTTPLIB)` are wrapped in `if(TARGET nlohmann_json)` /
+   `if(TARGET httplib)` — when the engine has already FetchContent'd them, treat
+   them as system so v11.8.0 doesn't fetch a second copy and collide on the
+   `add_library(nlohmann_json)` / `add_library(httplib)` target names.
+2. **`add_test` override gated on BUILD_TESTING**: v11.8.0 replaces `add_test`
+   with a global FATAL_ERROR function, which poisons every later `add_test()` in
+   a parent build. The override is now inside `if(BUILD_TESTING)` (the engine
+   builds with BUILD_TESTING=OFF, so the builtin stays).
+3. **zstd supplied when the target is missing**: the engine's `cpp_httplib`
+   links `zstd::libzstd`; the old vendored lemonade was the only provider of
+   that target. The FetchContent gate is now
+   `if(NOT USE_SYSTEM_ZSTD OR NOT TARGET zstd::libzstd)`.
 ## Local patch: embeddability
 
 `CMakeLists.txt` carries one local patch (see the "Embedding" comment near
