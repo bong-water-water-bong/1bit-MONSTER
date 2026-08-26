@@ -45,6 +45,8 @@
 #include <vector>
 #include <memory>
 #include <string>
+#include <algorithm>
+#include <functional>
 
 #include <xrt/xrt_device.h>
 #include <xrt/xrt_bo.h>
@@ -165,14 +167,21 @@ struct AttnCtx {
                 for (int nt = 0; nt < n_n; nt++) {
                     const int8_t* tile = KTm + (size_t)kv * K * N
                                        + (size_t)(ki * n_n + nt) * (64 * 128);
-                    for (int t2 = 0; t2 < 128; t2++) {
-                        int32_t acc = 0;
-                        for (int d2 = 0; d2 < 64; d2++)
-                            acc += (int32_t)qh[ki * 64 + d2] * tile[d2 * 128 + t2];
-                        int t = nt * 128 + t2;
-                        int32_t* c1t = (t < 128) ? c1a : c1b;
-                        c1t[c1_idx(0, t & 127)] += acc;
-                    }
+                    // unpack the mmul chunk interleave: pos = i0·1024+i1·64+
+                    // i2·8+i3 holds K^T[k=ki·64+i0·8+i2][t=nt·128+i1·8+i3]
+                    for (int i0 = 0; i0 < 8; i0++)
+                        for (int i1 = 0; i1 < 16; i1++)
+                            for (int i2 = 0; i2 < 8; i2++) {
+                                const int d = ki * 64 + i0 * 8 + i2;
+                                const int8_t* d8 = tile + (size_t)i0 * 1024
+                                                 + i1 * 64 + i2 * 8;
+                                for (int i3 = 0; i3 < 8; i3++) {
+                                    const int t = nt * 128 + i1 * 8 + i3;
+                                    int32_t* c1t = (t < 128) ? c1a : c1b;
+                                    c1t[c1_idx(0, t & 127)] +=
+                                        (int32_t)qh[d] * d8[i3];
+                                }
+                            }
                 }
             attn_softmax_contract(c1a, c1b, params, a2);
             const float* svh = &sv[(size_t)kv * hd];
@@ -182,8 +191,18 @@ struct AttnCtx {
             float* oh = ao + (size_t)h * hd;
             for (int d = 0; d < hd; d++) {
                 int32_t c2 = 0;
-                for (int t = 0; t < N; t++)
-                    c2 += (int32_t)a2[t] * Vm[(size_t)kv * N * K + (size_t)t * hd + d];
+                // unpack the V chunk interleave: pos = ki·8192+i0·1024+i1·64+
+                // i2·8+i3 holds V[t=ki·64+i0·8+i2][d=i1·8+i3]
+                const int i1 = d / 8, i3 = d % 8;
+                for (int ki = 0; ki < N / 64; ki++)
+                    for (int i0 = 0; i0 < 8; i0++)
+                        for (int i2 = 0; i2 < 8; i2++) {
+                            const int t = ki * 64 + i0 * 8 + i2;
+                            const int8_t* d8 = Vm + (size_t)kv * N * K
+                                             + (size_t)ki * 8192
+                                             + (size_t)i0 * 1024 + i1 * 64 + i2 * 8;
+                            c2 += (int32_t)a2[t] * d8[i3];
+                        }
                 float val = (float)c2 * (svh[d] / 127.0f) / z;
                 if (!std::isfinite(val)) val = 0;
                 oh[d] = val;
@@ -233,41 +252,57 @@ struct AttnCtx {
         std::memcpy(Qm + (size_t)15 * K_FRAME, params, sizeof(params));
         bQ->sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
-        // ── bo1: K^T per kv, per (ki,nt) 64×128 tile, row-major (d,t) ──
-        //    tile[d2·128 + t2] = K[kv][nt·128+t2][ki·64+d2]·sk
+        // ── bo1: K^T per kv, per (ki,nt) 64×128 tile, in the MMUL B chunk
+        //    order (pack_tile_chunk interleave — the fused kernel's proven
+        //    layout): byte i0·1024 + i1·64 + i2·8 + i3 holds B[k][n] with
+        //    k = ki·64 + i0·8 + i2 (K-dim), n = nt·128 + i1·8 + i3 (t). A
+        //    row-major pack mispairs (d,t) and scrambles the QK^T scores. ──
         const int n_k = K / 64, n_n = N / 128;
         for (int kv = 0; kv < nkv; kv++)
             for (int ki = 0; ki < n_k; ki++)
                 for (int nt = 0; nt < n_n; nt++) {
                     int8_t* tile = KTm + (size_t)kv * K * N
                                   + (size_t)(ki * n_n + nt) * (64 * 128);
-                    for (int d2 = 0; d2 < 64; d2++) {
-                        const int d = ki * 64 + d2;
-                        const float* kcol = ko + (size_t)nt * 128 * kd
-                                           + (size_t)kv * hd + d;
-                        for (int t2 = 0; t2 < 128; t2++) {
-                            int v = (int)std::lround(kcol[(size_t)t2 * kd] * sk);
-                            if (v > 127) v = 127; else if (v < -127) v = -127;
-                            tile[d2 * 128 + t2] = (int8_t)v;
-                        }
-                    }
+                    for (int i0 = 0; i0 < 8; i0++)
+                        for (int i1 = 0; i1 < 16; i1++)
+                            for (int i2 = 0; i2 < 8; i2++) {
+                                const int d = ki * 64 + i0 * 8 + i2;
+                                const float* kcol = ko + (size_t)nt * 128 * kd
+                                                   + (size_t)kv * hd + d;
+                                int8_t* d8 = tile + (size_t)i0 * 1024 + i1 * 64 + i2 * 8;
+                                for (int i3 = 0; i3 < 8; i3++) {
+                                    const int t = nt * 128 + i1 * 8 + i3;
+                                    int v = (int)std::lround(kcol[(size_t)t * kd] * sk);
+                                    if (v > 127) v = 127; else if (v < -127) v = -127;
+                                    d8[i3] = (int8_t)v;
+                                }
+                            }
                 }
         bKT->sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
-        // ── bo3: V per kv, t-major d-minor; t ≥ seq zeroed (causal) ──
+        // ── bo3: V per kv — the PV mmul B operand (B[k=t][n=d]), same chunk
+        //    interleave: byte i0·1024 + i1·64 + i2·8 + i3 holds V[t][d] with
+        //    t = ki·64 + i0·8 + i2, d = i1·8 + i3. t ≥ seq zeroed (causal). ──
         for (int kv = 0; kv < nkv; kv++)
-            for (int t = 0; t < N; t++)
-                for (int d = 0; d < hd; d++) {
-                    int idx = (int)((size_t)kv * N * K + (size_t)t * hd + d);
-                    if (t < seq) {
-                        float vv = vo[(size_t)t * kd + (size_t)kv * hd + d];
-                        int v = (int)std::lround(vv / sv[(size_t)kv * hd + d]);
-                        if (v > 127) v = 127; else if (v < -127) v = -127;
-                        Vm[idx] = (int8_t)v;
-                    } else {
-                        Vm[idx] = 0;
-                    }
-                }
+            for (int ki = 0; ki < N / 64; ki++)
+                for (int i0 = 0; i0 < 8; i0++)
+                    for (int i1 = 0; i1 < 16; i1++)
+                        for (int i2 = 0; i2 < 8; i2++) {
+                            const int t = ki * 64 + i0 * 8 + i2;
+                            int8_t* d8 = Vm + (size_t)kv * N * K
+                                       + (size_t)ki * 8192
+                                       + (size_t)i0 * 1024 + i1 * 64 + i2 * 8;
+                            for (int i3 = 0; i3 < 8; i3++) {
+                                int v = 0;
+                                if (t < seq) {
+                                    const int d = i1 * 8 + i3;
+                                    float vv = vo[(size_t)t * kd + (size_t)kv * hd + d];
+                                    v = (int)std::lround(vv / sv[(size_t)kv * hd + d]);
+                                    if (v > 127) v = 127; else if (v < -127) v = -127;
+                                }
+                                d8[i3] = (int8_t)v;
+                            }
+                        }
 
         // Host-emulation mode (NPU_ATTN_EMU=1): run the exact kernel math on
         // the packed buffers with the SHIPPED on-core softmax contract — pins
@@ -308,8 +343,9 @@ struct AttnCtx {
             fprintf(stderr, "[attnDump] A2 head0 t=0..3: %d %d %d %d | t=128..131: %d %d %d %d\n",
                     (int)a2h[0], (int)a2h[1], (int)a2h[2], (int)a2h[3],
                     (int)a2h[128], (int)a2h[129], (int)a2h[130], (int)a2h[131]);
-            // Isolate QK^T+softmax: expected A2 from the packed C1 via the
-            // SHIPPED contract vs the kernel-delivered A2.
+            // Expected A2 from the packed C1 (mmul chunk interleave unpacked)
+            // via the SHIPPED contract vs the kernel-delivered A2 — confirms
+            // the packing + QK^T end to end.
             {
                 int32_t c1a[1024], c1b[1024];
                 int8_t a2exp[8 * 256];
@@ -318,28 +354,45 @@ struct AttnCtx {
                 for (int ki = 0; ki < K / 64; ki++)
                     for (int nt = 0; nt < N / 128; nt++) {
                         const int8_t* tile = KTm + (size_t)(ki * (N / 128) + nt) * (64 * 128);
-                        for (int t2 = 0; t2 < 128; t2++) {
-                            int32_t acc = 0;
-                            for (int d2 = 0; d2 < 64; d2++)
-                                acc += (int32_t)qh[ki * 64 + d2] * tile[d2 * 128 + t2];
-                            int t = nt * 128 + t2;
-                            int32_t* c1t = (t < 128) ? c1a : c1b;
-                            c1t[(t & 127) / 8 * 64 + (t & 127) % 8] += acc;
-                        }
+                        for (int i0 = 0; i0 < 8; i0++)
+                            for (int i1 = 0; i1 < 16; i1++)
+                                for (int i2 = 0; i2 < 8; i2++) {
+                                    const int d = ki * 64 + i0 * 8 + i2;
+                                    const int8_t* d8 = tile + (size_t)i0 * 1024
+                                                     + i1 * 64 + i2 * 8;
+                                    for (int i3 = 0; i3 < 8; i3++) {
+                                        const int t = nt * 128 + i1 * 8 + i3;
+                                        int32_t* c1t = (t < 128) ? c1a : c1b;
+                                        c1t[(t & 127) / 8 * 64 + (t & 127) % 8] +=
+                                            (int32_t)qh[d] * d8[i3];
+                                    }
+                                }
                     }
                 attn_softmax_contract(c1a, c1b, params, a2exp);
+                bool ok = true;
                 fprintf(stderr, "[attnDump] A2 exp vs del t=0..8: ");
-                for (int t = 0; t < 9; t++)
+                for (int t = 0; t < 9; t++) {
                     fprintf(stderr, "%d/%d ", (int)a2exp[t], (int)a2h[t]);
-                fprintf(stderr, "\n");
+                    if (a2exp[t] != a2h[t]) ok = false;
+                }
+                fprintf(stderr, "-> %s\n", ok ? "QK^T MATCH (packing fixed)"
+                                              : "QK^T mismatch");
             }
             // Decode the delivered C2: expected[d] = Σ_t A2[t]·V[t][d]; match
             // each delivered int32 to its true column to reveal any permutation.
             {
                 std::vector<int32_t> expv(hd, 0);
-                for (int d = 0; d < hd; d++)
-                    for (int t = 0; t < seq; t++)
-                        expv[d] += (int32_t)a2h[t] * Vm[(size_t)t * hd + d];
+                for (int d = 0; d < hd; d++) {
+                    const int i1 = d / 8, i3 = d % 8;
+                    for (int ki = 0; ki < N / 64; ki++)
+                        for (int i0 = 0; i0 < 8; i0++)
+                            for (int i2 = 0; i2 < 8; i2++) {
+                                const int t = ki * 64 + i0 * 8 + i2;
+                                const int8_t* d8 = Vm + (size_t)ki * 8192
+                                                 + (size_t)i0 * 1024 + i1 * 64 + i2 * 8;
+                                expv[d] += (int32_t)a2h[t] * d8[i3];
+                            }
+                }
                 fprintf(stderr, "[attnDump] delivered→true-col match (head0):\n");
                 int shown = 0;
                 for (int p = 0; p < 8 * hd && shown < 24; p++) {

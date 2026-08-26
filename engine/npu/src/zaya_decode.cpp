@@ -454,7 +454,7 @@ int zaya_decode_main(int argc, char** argv) {
                 };
                 if (NPU_ATTN && attn_ctx.ready) {
                     attn_ctx.run(qo.data(), lk.data(), lv.data(), seq, ao.data());
-                    if (ATTN_DIAG && l <= 4 && pos == 0) {
+                    if (ATTN_DIAG && l == 0 && pos == 0) {
                         // Per-layer accuracy probe: NPU ao vs the CPU float scan.
                         std::vector<float> cpu_ao(qd);
                         cpu_attn_scan(cpu_ao);
