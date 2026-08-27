@@ -728,22 +728,20 @@ extern "C" void matmul_i8_i32_i4(const int8_t *__restrict pA,
             for (unsigned jt = 0; jt < 4; ++jt) {
                 unsigned j = jg + jt;   // col-tile index 0..15
                 const uint8_t* nib = pB4 + i * 512 + j * 32;
-                const uint8_t* rsp = pB4 + 4096 + (i / 4) * 256 + j * 16;
-                const uint8_t* scp = pB4 + 4608 + j * 16;
-                float ratio[8];
-                for (int c = 0; c < 8; c++) {
-                    uint32_t rb = (uint32_t)((uint16_t)rsp[2*c] | ((uint16_t)rsp[2*c+1] << 8)) << 16;
-                    uint32_t sb = (uint32_t)((uint16_t)scp[2*c] | ((uint16_t)scp[2*c+1] << 8)) << 16;
-                    float sf, scc; memcpy(&sf, &rb, 4); memcpy(&scc, &sb, 4);
-                    ratio[c] = (sf * 0.0625f) / scc;
-                }
+                // v65 ratioQ22 (int32) at [4096 + group*512 + col*4] — the
+                // old bf16 s/S_col reads at [4096..4864) were removed in the
+                // v65 pack (they overlapped the ratio region). group = k/32
+                // within the 64-tile = i/4 for k-chunk i.
+                const int32_t* rq = (const int32_t*)(pB4 + 4096 + (size_t)(i / 4) * 512
+                                                     + (size_t)j * 32);
                 const v64int4* pv = (const v64int4*)nib;
                 v64int8 u = __builtin_aie2p_unpack_I512_I8_I4(*pv, 1);
                 u = u + u; u = u + u; u = u + u; u = u + u;   // q4<<4
                 for (int e = 0; e < 64; e++) {
-                    float v = (float)(int8_t)u[e] * ratio[e & 7];
-                    int x = silu_roundf(v);
-                    Bb[jt][e] = (int8_t)(x > 127 ? 127 : x < -127 ? -127 : x);
+                    // B'' = sat8(round((q4<<4) * ratioQ22 / 2^22))
+                    int x = (int)(int8_t)u[e] * rq[e & 7];
+                    int r = (x + (1 << 21)) >> 22;
+                    Bb[jt][e] = (int8_t)(r > 127 ? 127 : r < -127 ? -127 : r);
                 }
             }
             aie::vector<int8, 64> B0 = aie::load_v<64>(Bb[0]);
