@@ -692,7 +692,20 @@ int zaya_decode_main(int argc, char** argv) {
                 };
                 if (NPU_ATTN && attn_ctx.ready) {
                     attn_ctx.run(qo.data(), lk.data(), lv.data(), seq, ao.data());
-                    if (ATTN_DIAG && l == 0 && pos == 0) {
+                    // comma list of positions to probe (default 0)
+                    // comma list of positions to probe (default 0)
+                    int ATTN_DIAG_POS = 0;
+                    if (getenv("NPU_ATTN_DIAG_POS")) {
+                        std::string pl = getenv("NPU_ATTN_DIAG_POS");
+                        size_t p0 = 0, p1 = pl.find(',' );
+                        while (true) {
+                            std::string tok = pl.substr(p0, p1 == std::string::npos ? std::string::npos : p1 - p0);
+                            if (pos == atoi(tok.c_str())) { ATTN_DIAG_POS = pos; break; }
+                            if (p1 == std::string::npos) break;
+                            p0 = p1 + 1; p1 = pl.find(',' , p0);
+                        }
+                    }
+                    if (ATTN_DIAG && l == 0 && pos == ATTN_DIAG_POS) {
                         // Per-layer accuracy probe: NPU ao vs the CPU float scan.
                         std::vector<float> cpu_ao(qd);
                         cpu_attn_scan(cpu_ao);

@@ -59,7 +59,7 @@
 
 struct AttnCtx {
     static constexpr int K_FRAME = 2048;   // fused A-frame row stride (bytes)
-    int MAX_SEQ = 256;                     // kernel-baked N (n1_core_attn.py -N)
+    int MAX_SEQ = 256;   // kernel-baked N; NPU_ATTN_MAX_SEQ overrides (N=512 xclbin is experimental)                     // kernel-baked N (n1_core_attn.py -N)
     int nq = 8, nkv = 2, hd = 128;         // Zaya1-8B GQA shapes
 
     std::unique_ptr<xrt::xclbin> xc;
@@ -77,6 +77,8 @@ struct AttnCtx {
     bool init(xrt::device& d, const char* xp, const char* ip,
               int nq_, int nkv_, int hd_) {
         nq = nq_; nkv = nkv_; hd = hd_;
+        if (getenv("NPU_ATTN_MAX_SEQ") && atoi(getenv("NPU_ATTN_MAX_SEQ")) > 0)
+            MAX_SEQ = atoi(getenv("NPU_ATTN_MAX_SEQ"));
         if (nq != 8 || nkv != 2 || hd != 128) {
             fprintf(stderr, "  AttnCtx: shapes nq=%d nkv=%d hd=%d unsupported "
                             "(kernel is baked for 8/2/128)\n", nq, nkv, hd);
@@ -156,13 +158,13 @@ struct AttnCtx {
         const int n_k = K / 64, n_n = N / 128;
         const float* params = (const float*)(Qm + (size_t)15 * K_FRAME);
         const int seq = (int)params[1];
-        int32_t c1a[1024], c1b[1024];
+        int32_t c1flat[4 * 1024];
+        const int32_t* c1p[4] = { c1flat, c1flat + 1024, c1flat + 2048, c1flat + 3072 };
         int8_t a2[8 * 256];
         for (int h = 0; h < nq; h++) {
             const int kv = h / gqa;
             const int8_t* qh = Qm + (size_t)h * K_FRAME;
-            std::memset(c1a, 0, sizeof(c1a));
-            std::memset(c1b, 0, sizeof(c1b));
+            std::memset(c1flat, 0, sizeof(c1flat));
             for (int ki = 0; ki < n_k; ki++)
                 for (int nt = 0; nt < n_n; nt++) {
                     const int8_t* tile = KTm + (size_t)kv * K * N
@@ -177,13 +179,12 @@ struct AttnCtx {
                                                  + i1 * 64 + i2 * 8;
                                 for (int i3 = 0; i3 < 8; i3++) {
                                     const int t = nt * 128 + i1 * 8 + i3;
-                                    int32_t* c1t = (t < 128) ? c1a : c1b;
-                                    c1t[c1_idx(0, t & 127)] +=
+                                    c1flat[(t >> 7) * 1024 + c1_idx(0, t & 127)] +=
                                         (int32_t)qh[d] * d8[i3];
                                 }
                             }
                 }
-            attn_softmax_contract(c1a, c1b, params, a2);
+            attn_softmax_contract(c1p, params, a2);
             const float* svh = &sv[(size_t)kv * hd];
             float z = 0;
             for (int t = 0; t < seq; t++) z += (float)a2[t] / 127.0f;
@@ -272,8 +273,11 @@ struct AttnCtx {
                                 int8_t* d8 = tile + (size_t)i0 * 1024 + i1 * 64 + i2 * 8;
                                 for (int i3 = 0; i3 < 8; i3++) {
                                     const int t = nt * 128 + i1 * 8 + i3;
-                                    int v = (int)std::lround(kcol[(size_t)t * kd] * sk);
-                                    if (v > 127) v = 127; else if (v < -127) v = -127;
+                                    int v = 0;   // t >= seq reads past the KV cache
+                                    if (t < seq) {
+                                        v = (int)std::lround(kcol[(size_t)t * kd] * sk);
+                                        if (v > 127) v = 127; else if (v < -127) v = -127;
+                                    }
                                     d8[i3] = (int8_t)v;
                                 }
                             }
@@ -347,9 +351,10 @@ struct AttnCtx {
             // via the SHIPPED contract vs the kernel-delivered A2 — confirms
             // the packing + QK^T end to end.
             {
-                int32_t c1a[1024], c1b[1024];
+                int32_t c1flat[4 * 1024];
+                const int32_t* c1p[4] = { c1flat, c1flat + 1024, c1flat + 2048, c1flat + 3072 };
                 int8_t a2exp[8 * 256];
-                std::memset(c1a, 0, sizeof(c1a)); std::memset(c1b, 0, sizeof(c1b));
+                std::memset(c1flat, 0, sizeof(c1flat));
                 const int8_t* qh = Qm;                       // head 0 row
                 for (int ki = 0; ki < K / 64; ki++)
                     for (int nt = 0; nt < N / 128; nt++) {
@@ -362,13 +367,13 @@ struct AttnCtx {
                                                      + i1 * 64 + i2 * 8;
                                     for (int i3 = 0; i3 < 8; i3++) {
                                         const int t = nt * 128 + i1 * 8 + i3;
-                                        int32_t* c1t = (t < 128) ? c1a : c1b;
-                                        c1t[(t & 127) / 8 * 64 + (t & 127) % 8] +=
+                                        c1flat[(t >> 7) * 1024 + (t & 127) / 8 * 64
+                                               + (t & 127) % 8] +=
                                             (int32_t)qh[d] * d8[i3];
                                     }
                                 }
                     }
-                attn_softmax_contract(c1a, c1b, params, a2exp);
+                attn_softmax_contract(c1p, params, a2exp);
                 bool ok = true;
                 fprintf(stderr, "[attnDump] A2 exp vs del t=0..8: ");
                 for (int t = 0; t < 9; t++) {
