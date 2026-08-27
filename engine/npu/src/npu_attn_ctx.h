@@ -59,7 +59,8 @@
 
 struct AttnCtx {
     static constexpr int K_FRAME = 2048;   // fused A-frame row stride (bytes)
-    int MAX_SEQ = 256;   // kernel-baked N; NPU_ATTN_MAX_SEQ overrides (N=512 xclbin is experimental)                     // kernel-baked N (n1_core_attn.py -N)
+    int MAX_SEQ = 512;   // kernel-baked N (shipped attn.xclbin = N=512 build);
+                     // kernel-baked N (n1_core_attn.py -N)
     int nq = 8, nkv = 2, hd = 128;         // Zaya1-8B GQA shapes
 
     std::unique_ptr<xrt::xclbin> xc;
@@ -160,7 +161,7 @@ struct AttnCtx {
         const int seq = (int)params[1];
         int32_t c1flat[4 * 1024];
         const int32_t* c1p[4] = { c1flat, c1flat + 1024, c1flat + 2048, c1flat + 3072 };
-        int8_t a2[8 * 256];
+        std::vector<int8_t> a2((size_t)8 * MAX_SEQ);   // sized by the baked N
         for (int h = 0; h < nq; h++) {
             const int kv = h / gqa;
             const int8_t* qh = Qm + (size_t)h * K_FRAME;
@@ -184,7 +185,7 @@ struct AttnCtx {
                                 }
                             }
                 }
-            attn_softmax_contract(c1p, params, a2);
+            attn_softmax_contract(c1p, params, a2.data());
             const float* svh = &sv[(size_t)kv * hd];
             float z = 0;
             for (int t = 0; t < seq; t++) z += (float)a2[t] / 127.0f;
@@ -268,8 +269,13 @@ struct AttnCtx {
                         for (int i1 = 0; i1 < 16; i1++)
                             for (int i2 = 0; i2 < 8; i2++) {
                                 const int d = ki * 64 + i0 * 8 + i2;
-                                const float* kcol = ko + (size_t)nt * 128 * kd
-                                                   + (size_t)kv * hd + d;
+                                // BUGFIX (1776): kcol must be the token-0 base
+                                // for THIS kv — t below already carries the
+                                // nt*128 tile offset, so adding nt*128*kd here
+                                // double-counted it and read t>=128 from
+                                // ko[(2*nt*128 + t)*kd] (OOB past the KV
+                                // cache -> garbage scores in N-tile nt>=1).
+                                const float* kcol = ko + (size_t)kv * hd + d;
                                 int8_t* d8 = tile + (size_t)i0 * 1024 + i1 * 64 + i2 * 8;
                                 for (int i3 = 0; i3 < 8; i3++) {
                                     const int t = nt * 128 + i1 * 8 + i3;
@@ -325,7 +331,8 @@ struct AttnCtx {
         // Raw-data dump (NPU_ATTN_DUMP=1): first attention call (seq==1) —
         // prints the exact kernel outputs vs what the emulation expects.
         static const bool DUMP = getenv("NPU_ATTN_DUMP") && atoi(getenv("NPU_ATTN_DUMP")) == 1;
-        if (DUMP && seq == 9) {
+        const int DSEQ = getenv("NPU_ATTN_DUMP_SEQ") ? atoi(getenv("NPU_ATTN_DUMP_SEQ")) : 9;
+        if (DUMP && seq == DSEQ) {
             fprintf(stderr, "[attnDump] params0=%.6e seq=%d\n", params[0], seq);
             const int32_t* t0 = C2m;                       // head 0 tile
             // Race check: re-scan after a delay to see if the S2MM is draining.
@@ -353,7 +360,7 @@ struct AttnCtx {
             {
                 int32_t c1flat[4 * 1024];
                 const int32_t* c1p[4] = { c1flat, c1flat + 1024, c1flat + 2048, c1flat + 3072 };
-                int8_t a2exp[8 * 256];
+                std::vector<int8_t> a2exp((size_t)8 * MAX_SEQ);   // sized by the baked N
                 std::memset(c1flat, 0, sizeof(c1flat));
                 const int8_t* qh = Qm;                       // head 0 row
                 for (int ki = 0; ki < K / 64; ki++)
@@ -373,7 +380,7 @@ struct AttnCtx {
                                     }
                                 }
                     }
-                attn_softmax_contract(c1p, params, a2exp);
+                attn_softmax_contract(c1p, params, a2exp.data());
                 bool ok = true;
                 fprintf(stderr, "[attnDump] A2 exp vs del t=0..8: ");
                 for (int t = 0; t < 9; t++) {
@@ -382,6 +389,88 @@ struct AttnCtx {
                 }
                 fprintf(stderr, "-> %s\n", ok ? "QK^T MATCH (packing fixed)"
                                               : "QK^T mismatch");
+                // N-tile boundary probe: does the kernel deliver the right A2
+                // for t in [128,136) and [256,264) (N=512 second/third tiles)?
+                for (int w0 = 0; w0 < 2; w0++) {
+                    const int t0 = w0 == 0 ? 126 : 254;
+                    bool okb = true;
+                    fprintf(stderr, "[attnDump] A2 exp vs del t=%d..%d: ", t0, t0 + 9);
+                    for (int t = t0; t < t0 + 10; t++) {
+                        fprintf(stderr, "%d/%d ", (int)a2exp[t], (int)a2h[t]);
+                        if (a2exp[t] != a2h[t]) okb = false;
+                    }
+                    fprintf(stderr, "-> %s\n", okb ? "tile MATCH" : "TILE MISMATCH");
+                }
+                // Z contribution by N-tile (delivered A2): how much of Z comes
+                // from t>=128 — a wrong A2 there shifts the dequant by a lot.
+                {
+                    float zlo = 0, zhi = 0;
+                    for (int t = 0; t < seq; t++) {
+                        float v = (float)a2h[t] / 127.0f;
+                        if (t < 128) zlo += v; else zhi += v;
+                    }
+                    fprintf(stderr, "[attnDump] Z t<128=%.4f t>=128=%.4f total=%.4f\n",
+                            zlo, zhi, zlo + zhi);
+                }
+                // CONTRACT-vs-FLOAT probe (head 0): does the int8 score x match
+                // the float q·k/√hd at seq>=128? Dump score deltas + weight
+                // deltas for a window around the tile boundary.
+                {
+                    // float reference from the RUNNING layer inputs (qo/ko/vo)
+                    const float* qf = qo;                      // head 0
+                    const float* kf = ko + (size_t)0 * hd;     // kv 0
+                    const float* vf = vo + (size_t)0 * hd;
+                    const float scale_f = 1.0f / std::sqrt((float)hd);
+                    const int32_t* c1a = c1p[0];
+                    const int32_t* c1b = c1p[1];
+                    const int32_t* c1c = c1p[2];
+                    const int32_t* c1d = c1p[3];
+                    float mx_f = -1e30f;
+                    for (int t = 0; t < seq; t++) {
+                        float s = 0;
+                        for (int dd = 0; dd < hd; dd++) s += qf[dd] * kf[(size_t)t * kd + dd];
+                        s *= scale_f;
+                        if (s > mx_f) mx_f = s;
+                    }
+                    float sm_f = 0;
+                    std::vector<float> wf(seq);
+                    for (int t = 0; t < seq; t++) {
+                        float s = 0;
+                        for (int dd = 0; dd < hd; dd++) s += qf[dd] * kf[(size_t)t * kd + dd];
+                        s *= scale_f;
+                        wf[t] = expf(s - mx_f); sm_f += wf[t];
+                    }
+                    fprintf(stderr, "[attnDump] FLOAT head0 mx=%.4f sm=%.4f Z=%.4f\n",
+                            mx_f, sm_f, sm_f);
+                    for (int w0 = 0; w0 < 2; w0++) {
+                        const int t0 = w0 == 0 ? 124 : 252;
+                        fprintf(stderr, "[attnDump] CvF t=%d..%d: ", t0, t0 + 7);
+                        for (int t = t0; t < t0 + 8; t++) {
+                            const int32_t* ct = t < 128 ? c1a : (t < 256 ? c1b : (t < 384 ? c1c : c1d));
+                            unsigned cc = ((t & 127) / 8) * 64 + ((t & 127) % 8);
+                            float x = (float)ct[cc] * params[0];
+                            float s = 0;
+                            for (int dd = 0; dd < hd; dd++) s += qf[dd] * kf[(size_t)t * kd + dd];
+                            s *= scale_f;
+                            float wc = (t < seq) ? (float)a2h[t] / 127.0f : 0.0f;
+                            float wfp = (t < seq) ? wf[t] / sm_f : 0.0f;
+                            fprintf(stderr, "[%d x=%.4f s=%.4f d=%.4f w=%.4f wf=%.4f] ",
+                                    t, x, s, x - s, wc, wfp);
+                        }
+                        fprintf(stderr, "\n");
+                    }
+                    // contract dequantized head0 vs float head0
+                    float zc = 0; for (int t = 0; t < seq; t++) zc += (float)a2h[t] / 127.0f;
+                    double cn = 0, c1 = 0, c2 = 0;
+                    for (int dd = 0; dd < hd; dd++) {
+                        float cv = (float)t0[((dd / 8) * 64) + (dd % 8)] * (sv[dd] / 127.0f) / zc;
+                        float fv = 0; for (int t = 0; t < seq; t++) fv += wf[t] * vf[(size_t)t * kd + dd];
+                        fv /= sm_f;
+                        cn += (double)cv * fv; c1 += (double)cv * cv; c2 += (double)fv * fv;
+                    }
+                    fprintf(stderr, "[attnDump] head0 contract-vs-float corr=%.6f maxdiff=%.6f\n",
+                            cn / std::sqrt(c1 * c2), 0.0);
+                }
             }
             // Decode the delivered C2: expected[d] = Σ_t A2[t]·V[t][d]; match
             // each delivered int32 to its true column to reveal any permutation.
@@ -410,6 +499,27 @@ struct AttnCtx {
                     shown++;
                 }
             }
+        if (DUMP && seq == DSEQ) {
+            const int32_t* t0 = C2m;                       // head 0 tile
+            std::vector<int32_t> expv(hd, 0);
+            for (int d = 0; d < hd; d++) {
+                const int i1 = d / 8, i3 = d % 8;
+                for (int ki = 0; ki < N / 64; ki++)
+                    for (int i0 = 0; i0 < 8; i0++)
+                        for (int i2 = 0; i2 < 8; i2++) {
+                            const int t = ki * 64 + i0 * 8 + i2;
+                            const int8_t* d8 = Vm + (size_t)ki * 8192
+                                             + (size_t)i0 * 1024 + i1 * 64 + i2 * 8;
+                            expv[d] += (int32_t)a2h[t] * d8[i3];
+                        }
+            }
+            float z = 0;
+            for (int t = 0; t < seq; t++) z += (float)a2h[t] / 127.0f;
+            fprintf(stderr, "[attnDump] seq=%d Z=%.4f C2raw[0..7]=%d %d %d %d %d %d %d %d expv[0..7]=%d %d %d %d %d %d %d %d sv[0..3]=%.5f %.5f %.5f %.5f\n",
+                    seq, z, (int)t0[0], (int)t0[1], (int)t0[2], (int)t0[3], (int)t0[4], (int)t0[5], (int)t0[6], (int)t0[7],
+                    (int)expv[0], (int)expv[1], (int)expv[2], (int)expv[3], (int)expv[4], (int)expv[5], (int)expv[6], (int)expv[7],
+                    sv[0], sv[1], sv[2], sv[3]);
+        }
         }
 
         // ── dequant: attn[h][d] = C2[h][d]·(sv[kv][d]/127)/Z_h ──
