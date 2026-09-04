@@ -1,0 +1,523 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="icon" type="image/svg+xml" href="assets/favicon.svg">
+  <link rel="icon" type="image/png" sizes="32x32" href="assets/favicon-32x32.png">
+  <link rel="icon" type="image/png" sizes="16x16" href="assets/favicon-16x16.png">
+  <link rel="apple-touch-icon" href="assets/apple-touch-icon.png">
+  <title>Zaya 8B Q4NX on the AMD NPU | 1bit.MONSTER</title>
+  <meta name="description" content="Milestone: an 8-billion-parameter model now runs entirely on AMD's laptop NPU — attention and experts on-device, served over HTTP, decode 8.4 tok/s. Full technical write-up: https://github.com/1bit-MONSTER/1bit-MONSTER/blob/main/research/ws12-hrx-loom/README.md" />
+  <meta property="og:site_name" content="1bit.MONSTER" />
+  <meta property="og:type" content="article" />
+  <meta property="og:title" content="Zaya 8B Q4NX on the AMD NPU | 1bit.MONSTER" />
+  <meta property="og:description" content="Milestone: an 8-billion-parameter model now runs entirely on AMD's laptop NPU — attention and experts on-device, served over HTTP, decode 8.4 tok/s. Full technical write-up: https://github.com/1bit-MONSTER/1bit-MONSTER/blob/main/research/ws12-hrx-loom/README.md" />
+  <meta property="og:url" content="https://1bit.monster/1bit-post-zaya-q4nx-hrx.html" />
+  <meta property="og:image" content="https://1bit.monster/assets/og-card.png" />
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:title" content="Zaya 8B Q4NX on the AMD NPU | 1bit.MONSTER" />
+  <meta name="twitter:description" content="Milestone: an 8-billion-parameter model now runs entirely on AMD's laptop NPU — attention and experts on-device, served over HTTP, decode 8.4 tok/s. Full technical write-up: https://github.com/1bit-MONSTER/1bit-MONSTER/blob/main/research/ws12-hrx-loom/README.md" />
+  <meta name="twitter:image" content="https://1bit.monster/assets/og-card.png" />
+  <link rel="canonical" href="https://1bit.monster/1bit-post-zaya-q4nx-hrx.html" />
+  <style>
+    /* ─── tokens ─────────────────────────────────────────────────────────
+       Bound verbatim to the locked light modern-minimal + 1-bit identity. */
+    :root {
+      --bg:      oklch(99% 0.002 240);
+      --surface: oklch(100% 0 0);
+      --fg:      oklch(18% 0.012 250);
+      --muted:   oklch(54% 0.012 250);
+      --border:  oklch(92% 0.005 250);
+      --accent:  oklch(58% 0.18 255);
+      --status:  oklch(52% 0.14 158);
+
+      --accent-soft:   color-mix(in oklch, var(--accent) 12%, transparent);
+      --fg-soft:       color-mix(in oklch, var(--fg) 5%, transparent);
+      --muted-strong:  color-mix(in oklch, var(--muted) 76%, var(--fg));
+      --hairblock:     color-mix(in oklch, var(--fg) 7%, transparent);
+
+      --font-display: -apple-system, BlinkMacSystemFont, 'SF Pro Display', system-ui, sans-serif;
+      --font-body:    -apple-system, BlinkMacSystemFont, 'SF Pro Text', system-ui, sans-serif;
+      --font-mono:    ui-monospace, 'SF Mono', 'SFMono-Regular', Menlo, Consolas, monospace;
+
+      --fs-h1: clamp(38px, 5vw, 64px);
+      --fs-h2: clamp(26px, 3vw, 34px);
+      --fs-lead: 19px;
+      --fs-body: 17px;
+      --fs-meta: 13px;
+      --radius: 10px;
+      --radius-lg: 16px;
+      --gap-sm: 12px; --gap-md: 20px; --gap-lg: 32px; --gap-xl: 48px; --gap-2xl: 80px;
+      --container: 760px; --gutter: 32px;
+    }
+    *, *::before, *::after { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--fg); font-family: var(--font-body); font-size: var(--fs-body); line-height: 1.7; text-rendering: optimizeLegibility; -webkit-font-smoothing: antialiased; }
+    a { color: inherit; text-decoration: none; }
+    p { text-wrap: pretty; }
+    h1, h2, h3, h4 { text-wrap: balance; }
+    ::selection { background: var(--accent-soft); color: var(--fg); }
+    :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 6px; }
+
+    .container { max-width: var(--container); margin-inline: auto; padding-inline: var(--gutter); }
+    .row-between { display: flex; align-items: center; justify-content: space-between; gap: var(--gap-md); }
+
+    .topnav { position: sticky; top: 0; z-index: 10; background: color-mix(in oklch, var(--bg) 92%, transparent); backdrop-filter: blur(12px); border-bottom: 1px solid var(--border); }
+    .topnav-inner { display: flex; align-items: center; justify-content: space-between; padding-block: 14px; }
+    .topnav .logo { display: inline-flex; align-items: center; gap: 10px; font-size: 17px; font-weight: 700; letter-spacing: -0.02em; }
+    .topnav .logo svg { width: 26px; height: 26px; color: var(--fg); }
+    /* header logo: 1bit relay mark - one block solid at a time, slow */
+    .topnav .logo .relay { fill: var(--surface); stroke: currentColor; stroke-opacity: 0.28; animation: logo-relay 80s ease-in-out infinite; }
+    .topnav .logo .r1 { animation-delay: 0s; }
+    .topnav .logo .r2 { animation-delay: 20s; }
+    .topnav .logo .r3 { animation-delay: 40s; }
+    .topnav .logo .r4 { animation-delay: 60s; }
+    @keyframes logo-relay {
+      0%       { fill: var(--surface); }
+      13%      { fill: var(--fg); }
+      14%      { fill: var(--fg); }
+      25%      { fill: var(--surface); }
+      100%     { fill: var(--surface); }
+    }
+    @media (prefers-reduced-motion: reduce) { .topnav .logo .relay { animation: none; } .topnav .logo .r1 { fill: var(--fg); } }
+
+    .topnav nav { display: flex; gap: var(--gap-lg); }
+    .topnav nav a { font-size: 14px; color: var(--muted-strong); white-space: nowrap; }
+    .topnav nav a:hover { color: var(--fg); }
+    .topnav nav a[aria-current="page"] { color: var(--fg); font-weight: 500; }
+    .pagefoot { padding-block: var(--gap-xl); color: var(--muted-strong); font-size: 13px; border-top: 1px solid var(--border); }
+    .pagefoot .place { font-family: var(--font-mono); font-size: 12px; letter-spacing: 0.02em; color: var(--muted-strong); text-align: center; margin: var(--gap-lg) auto 0; }
+    .pagefoot .quote { font-family: var(--font-mono); font-size: 12px; letter-spacing: 0.02em; color: var(--muted-strong); text-align: center; margin: var(--gap-sm) auto 0; }
+    .btn { display: inline-flex; align-items: center; gap: 8px; padding: 11px 20px; border-radius: var(--radius); border: 1px solid transparent; font-size: 14px; font-weight: 500; letter-spacing: -0.005em; transition: transform 0.05s ease, background 0.15s ease, border-color 0.15s ease, color 0.15s ease; }
+    .btn-ghost { background: transparent; color: var(--fg); padding-inline: 8px; }
+    .btn-ghost:hover { color: var(--accent); }
+
+    .art { padding-block: clamp(48px, 7vw, 96px) clamp(40px, 6vw, 72px); }
+    .art .back { font-family: var(--font-mono); font-size: 12px; letter-spacing: 0.06em; color: var(--muted-strong); display: inline-flex; gap: 6px; margin-bottom: var(--gap-lg); }
+    .art .back a:hover { color: var(--fg); }
+    .art-meta { display: flex; flex-wrap: wrap; gap: var(--gap-md); align-items: center; margin-bottom: var(--gap-md); font-family: var(--font-mono); font-size: 12px; letter-spacing: 0.04em; color: var(--muted-strong); }
+    .art-meta .tag { padding: 4px 10px; border: 1px solid var(--border); border-radius: 999px; }
+    .art-meta .tag.corr { border-color: color-mix(in oklch, var(--accent) 40%, transparent); border-style: dashed; color: color-mix(in oklch, var(--muted) 62%, var(--fg)); }
+    .art h1 { font-family: var(--font-display); font-size: var(--fs-h1); line-height: 1.08; letter-spacing: -0.02em; font-weight: 600; margin: 0 0 var(--gap-md); }
+    .art .lead { font-size: var(--fs-lead); line-height: 1.6; color: var(--muted-strong); max-width: 64ch; margin: 0 0 var(--gap-2xl); }
+
+    .prose h2 { font-family: var(--font-display); font-size: var(--fs-h2); line-height: 1.16; letter-spacing: -0.015em; font-weight: 600; margin: var(--gap-2xl) 0 var(--gap-md); }
+    .prose p { margin: 0 0 var(--gap-md); }
+    .prose b { font-weight: 600; }
+    .prose .mono { font-family: var(--font-mono); font-size: 0.92em; }
+    .prose code { font-family: var(--font-mono); font-size: 0.9em; background: var(--hairblock); padding: 2px 6px; border-radius: 4px; }
+    .prose pre { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 18px 20px; overflow-x: auto; font-family: var(--font-mono); font-size: 13px; line-height: 1.85; margin: 0 0 var(--gap-lg); }
+    .prose table { width: 100%; border-collapse: collapse; margin: 0 0 var(--gap-lg); font-size: 15px; }
+    .prose th, .prose td { text-align: left; padding: 11px 14px; border-bottom: 1px solid var(--border); }
+    .prose th { font-family: var(--font-mono); font-size: 12px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted-strong); font-weight: 500; }
+    .prose td { font-family: var(--font-mono); font-size: 14px; }
+    .prose .callout { border-left: 1px solid var(--accent); padding: 4px 0 4px var(--gap-lg); margin: 0 0 var(--gap-lg); }
+    @media (max-width: 720px) {
+      .topnav-inner { flex-wrap: wrap; row-gap: 12px; }
+      .topnav nav { order: 3; width: 100%; gap: var(--gap-md); justify-content: space-between; flex-wrap: wrap; }
+    }
+      /* ─── 1bit theme modes ────────────────────────────────────────────────
+       light mode (default) | auto (follows OS) | dark mode.
+       Appended by scripts/site_theme_modes.py — rerun to regenerate. */
+    :root {
+      color-scheme: light;
+    }
+    :root[data-theme="dark"] {
+      color-scheme: dark;
+    }
+    :root[data-theme="dark"] {
+        color-scheme: dark;
+        --bg:      oklch(16.5% 0.014 250);
+        --surface: oklch(21% 0.016 250);
+        --fg:      oklch(94% 0.01 250);
+        --muted:   oklch(68% 0.02 250);
+        --border:  oklch(29% 0.018 250);
+        --accent:  oklch(74% 0.15 258);
+        --status:  oklch(79% 0.13 156);
+        /* pinned: these carry the "ink console / paper" identity in both modes */
+        --ink-deep:      oklch(26% 0.011 250);
+        --on-dark:       oklch(97% 0.004 250);
+        --on-dark-muted: color-mix(in oklch, white 68%, transparent);
+        --border-dark:   color-mix(in oklch, white 18%, transparent);
+    }
+    :root[data-theme="dark"] .btn-primary {
+        background: color-mix(in oklch, var(--accent) 62%, black);
+        color: oklch(98% 0.002 250);
+    }
+    :root[data-theme="dark"] .btn-primary:hover {
+        background: color-mix(in oklch, var(--accent) 74%, black);
+    }
+    :root[data-theme="dark"] .section-dark .btn-primary {
+        background: var(--accent-bright);
+        color: var(--ink-deep);
+    }
+    :root[data-theme="dark"] .section-dark .btn-primary:hover {
+        background: color-mix(in oklch, var(--accent) 88%, white);
+    }
+    :root[data-theme="dark"] .codeblock {
+        background: oklch(23% 0.015 250);
+        color: oklch(95% 0.005 250);
+    }
+    :root[data-theme="dark"] .codeblock .c {
+        color: color-mix(in oklch, oklch(95% 0.005 250) 55%, transparent);
+    }
+    :root[data-theme="dark"] .product-tile {
+        background: linear-gradient(180deg, oklch(99.4% 0.002 240), oklch(96% 0.004 250));
+    }
+    :root[data-theme="dark"] .sticker-tile {
+        background-color: oklch(96.8% 0.004 250);
+        background-image: radial-gradient(color-mix(in oklch, oklch(18% 0.012 250) 16%, transparent) 1px, transparent 1px);
+        color: oklch(26% 0.011 250);
+    }
+    :root[data-theme="dark"] .product-tile .sheet {
+        fill: oklch(99.4% 0.002 240);
+        stroke: oklch(26% 0.011 250);
+    }
+    :root[data-theme="dark"] .product-tile .ink, .product-tile .p-ink, .product-tile .ink-stroke {
+        fill: oklch(26% 0.011 250);
+    }
+    :root[data-theme="dark"] .product-tile .ink-stroke {
+        stroke: oklch(26% 0.011 250);
+    }
+    :root[data-theme="dark"] .product-tile .ink2 {        fill: oklch(39% 0.009 250);
+    }
+    :root[data-theme="dark"] .product-tile .sub {        fill: oklch(52% 0.008 250);
+    }
+    :root[data-theme="dark"] .product-tile .shade {        fill: color-mix(in oklch, oklch(18% 0.012 250) 13%, transparent);
+    }
+    :root[data-theme="dark"] .product-tile .p-mid {        fill: oklch(45% 0.009 250);
+    }
+    :root[data-theme="dark"] .product-tile .p-soft {        fill: oklch(75% 0.005 250);
+    }
+    :root[data-theme="dark"] .product-tile .p-foot {        fill: color-mix(in oklch, oklch(18% 0.012 250) 16%, transparent);
+    }
+    :root[data-theme="dark"] .product-tile .print, .product-tile .p-print, .product-tile .p-line, .product-tile .relay {
+        fill: oklch(99% 0.001 240);
+    }
+    :root[data-theme="dark"] .product-tile .print-stroke {
+        stroke: oklch(99% 0.001 240);
+    }
+
+    @media (prefers-color-scheme: dark) {
+    :root[data-theme="auto"] {
+    color-scheme: dark;
+    --bg:      oklch(16.5% 0.014 250);
+    --surface: oklch(21% 0.016 250);
+    --fg:      oklch(94% 0.01 250);
+    --muted:   oklch(68% 0.02 250);
+    --border:  oklch(29% 0.018 250);
+    --accent:  oklch(74% 0.15 258);
+    --status:  oklch(79% 0.13 156);
+    /* pinned: these carry the "ink console / paper" identity in both modes */
+    --ink-deep:      oklch(26% 0.011 250);
+    --on-dark:       oklch(97% 0.004 250);
+    --on-dark-muted: color-mix(in oklch, white 68%, transparent);
+    --border-dark:   color-mix(in oklch, white 18%, transparent);
+    }
+    :root[data-theme="auto"] .btn-primary {
+    background: color-mix(in oklch, var(--accent) 62%, black);
+    color: oklch(98% 0.002 250);
+    }
+    :root[data-theme="auto"] .btn-primary:hover {
+    background: color-mix(in oklch, var(--accent) 74%, black);
+    }
+    :root[data-theme="auto"] .section-dark .btn-primary {
+    background: var(--accent-bright);
+    color: var(--ink-deep);
+    }
+    :root[data-theme="auto"] .section-dark .btn-primary:hover {
+    background: color-mix(in oklch, var(--accent) 88%, white);
+    }
+    :root[data-theme="auto"] .codeblock {
+    background: oklch(23% 0.015 250);
+    color: oklch(95% 0.005 250);
+    }
+    :root[data-theme="auto"] .codeblock .c {
+    color: color-mix(in oklch, oklch(95% 0.005 250) 55%, transparent);
+    }
+    :root[data-theme="auto"] .product-tile {
+    background: linear-gradient(180deg, oklch(99.4% 0.002 240), oklch(96% 0.004 250));
+    }
+    :root[data-theme="auto"] .sticker-tile {
+    background-color: oklch(96.8% 0.004 250);
+    background-image: radial-gradient(color-mix(in oklch, oklch(18% 0.012 250) 16%, transparent) 1px, transparent 1px);
+    color: oklch(26% 0.011 250);
+    }
+    :root[data-theme="auto"] .product-tile .sheet {
+    fill: oklch(99.4% 0.002 240);
+    stroke: oklch(26% 0.011 250);
+    }
+    :root[data-theme="auto"] .product-tile .ink, .product-tile .p-ink, .product-tile .ink-stroke {
+    fill: oklch(26% 0.011 250);
+    }
+    :root[data-theme="auto"] .product-tile .ink-stroke {
+    stroke: oklch(26% 0.011 250);
+    }
+    :root[data-theme="auto"] .product-tile .ink2 {    fill: oklch(39% 0.009 250);
+    }
+    :root[data-theme="auto"] .product-tile .sub {    fill: oklch(52% 0.008 250);
+    }
+    :root[data-theme="auto"] .product-tile .shade {    fill: color-mix(in oklch, oklch(18% 0.012 250) 13%, transparent);
+    }
+    :root[data-theme="auto"] .product-tile .p-mid {    fill: oklch(45% 0.009 250);
+    }
+    :root[data-theme="auto"] .product-tile .p-soft {    fill: oklch(75% 0.005 250);
+    }
+    :root[data-theme="auto"] .product-tile .p-foot {    fill: color-mix(in oklch, oklch(18% 0.012 250) 16%, transparent);
+    }
+    :root[data-theme="auto"] .product-tile .print, .product-tile .p-print, .product-tile .p-line, .product-tile .relay {
+    fill: oklch(99% 0.001 240);
+    }
+    :root[data-theme="auto"] .product-tile .print-stroke {
+    stroke: oklch(99% 0.001 240);
+    }
+    }
+    /* auto + light: nothing to override — the base tokens are already light. */
+
+    /* ─── theme switch (light / auto / dark) ───────────────────────── */
+    .theme-switch {
+      display: inline-flex; align-items: center; gap: 2px;
+      padding: 3px; border: 1px solid var(--border); border-radius: 999px;
+      background: color-mix(in oklch, var(--fg) 4%, transparent);
+      flex: 0 0 auto;
+    }
+    .theme-switch .ts-btn {
+      display: inline-flex; align-items: center; justify-content: center;
+      width: 26px; height: 24px; padding: 0; border: 0; border-radius: 999px;
+      background: transparent; color: var(--muted); cursor: pointer;
+      transition: background 0.15s ease, color 0.15s ease;
+    }
+    .theme-switch .ts-btn:hover { color: var(--fg); }
+    .theme-switch .ts-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+    html[data-theme="light"] .theme-switch [data-choice="light"],
+    html[data-theme="auto"]  .theme-switch [data-choice="auto"],
+    html[data-theme="dark"]  .theme-switch [data-choice="dark"] {
+      background: var(--surface); color: var(--fg);
+      box-shadow: 0 1px 3px color-mix(in oklch, var(--fg) 18%, transparent);
+    }
+    @media (max-width: 720px) {
+      .topnav-inner { flex-wrap: wrap; row-gap: 12px; }
+      .topnav nav { order: 3; width: 100%; gap: var(--gap-md); justify-content: space-between; flex-wrap: wrap; }
+      .theme-switch { order: 4; }
+    }
+
+
+</style>
+  <script type="application/ld+json">
+  {"@context": "https://schema.org", "@type": "BlogPosting", "headline": "Zaya 8B Q4NX on the AMD NPU | 1bit.MONSTER", "description": "Milestone: an 8-billion-parameter model now runs entirely on AMD's laptop NPU — attention and experts on-device, served over HTTP, decode 8.4 tok/s. Full technical write-up: https://github.com/1bit-MONSTER/1bit-MONSTER/blob/main/research/ws12-hrx-loom/README.md", "url": "https://1bit.monster/1bit-post-zaya-q4nx-hrx.html", "mainEntityOfPage": "https://1bit.monster/1bit-post-zaya-q4nx-hrx.html", "image": "https://1bit.monster/assets/og-card.png", "datePublished": "2026-08-31", "dateModified": "2026-09-02", "author": {"@type": "Organization", "name": "1bit.MONSTER", "url": "https://1bit.monster"}, "publisher": {"@type": "Organization", "name": "1bit.MONSTER", "url": "https://1bit.monster"}}
+  </script>
+
+  <script src="theme.js"></script>
+</head>
+<body>
+  <header class="topnav" data-od-id="topnav">
+    <div class="container topnav-inner" style="max-width: 1000px;">
+      <a href="index.html" class="logo">
+        <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <rect class="relay r1" x="2" y="2" width="9" height="9" rx="2"/><rect class="relay r2" x="13" y="2" width="9" height="9" rx="2"/><rect class="relay r3" x="2" y="13" width="9" height="9" rx="2"/><rect class="relay r4" x="13" y="13" width="9" height="9" rx="2"/>
+        </svg>
+        <span>1bit.MONSTER</span>
+      </a>
+      <nav>
+        <a href="1bit-monster-v2.html">Engine</a>
+        <a href="1bit-models.html">Models</a>
+        <a href="1bit-jarvis.html">1bit JARVIS</a>
+        <a href="1bit-blog.html" aria-current="page">Blog</a>
+        <a href="1bit-store.html">Store</a>
+        <a href="1bit-docs.html">Docs</a>
+        <a href="1bit-benchmarks.html">Benchmarks</a>
+        <a href="1bit-downloads.html">Downloads</a>
+      </nav>
+      
+      <span class="theme-switch" role="group" aria-label="Theme: light, auto, or dark">
+        <button type="button" class="ts-btn" data-choice="light" title="Light mode" aria-label="Light mode" aria-pressed="false">
+          <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4.2"/><path d="M12 2.4v2.6M12 19v2.6M2.4 12H5M19 12h2.6M4.9 4.9l1.9 1.9M17.2 17.2l1.9 1.9M19.1 4.9l-1.9 1.9M6.8 17.2l-1.9 1.9"/></svg>
+        </button>
+        <button type="button" class="ts-btn" data-choice="auto" title="Auto (follow system)" aria-label="Auto (follow system)" aria-pressed="false">
+          <svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true"><path d="M12 3a9 9 0 1 0 0 18V3Z" fill="currentColor"/><circle cx="12" cy="12" r="8.6" fill="none" stroke="currentColor" stroke-width="1.7"/></svg>
+        </button>
+        <button type="button" class="ts-btn" data-choice="dark" title="Dark mode" aria-label="Dark mode" aria-pressed="false">
+          <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20.2 14.6A8.4 8.4 0 1 1 9.4 3.8 6.9 6.9 0 0 0 20.2 14.6Z"/></svg>
+        </button>
+      </span>
+
+<a class="btn btn-ghost" href="https://github.com/1bit-MONSTER/1bit-MONSTER">GitHub&nbsp;↗</a>
+    </div>
+  </header>
+
+  <main id="content">
+    <article class="art container" data-od-id="post-zaya-q4nx-hrx">
+      <a class="back" href="1bit-blog.html">&larr; all posts</a>
+      <div class="art-meta">
+        <span>2026-09-01</span>
+        <span class="tag">npu</span>
+        <span class="tag">hrx</span>
+        <span class="tag">q4nx</span>
+        <span class="tag">zaya</span>
+      </div>
+      <h1>Zaya 8B Q4NX on the AMD NPU</h1>
+      <p class="lead">Zyphra&rsquo;s Zaya 8B, quantized to our Q4NX tile format, running entirely on the AMD Strix Halo NPU &mdash; attention and MoE both on-device, no CPU fallback. Logits match the F32 reference to float noise, decode does 8.4&nbsp;t/s, and it serves over HTTP.</p>
+
+      
+      <div class="callout"><p><b>Milestone:</b> an 8-billion-parameter model now runs entirely on AMD's laptop NPU — attention and experts on-device, served over HTTP, decode 8.4 tok/s. <a href="https://github.com/1bit-MONSTER/1bit-MONSTER/blob/main/research/ws12-hrx-loom/README.md">Full technical write-up &rarr; ws12-hrx-loom rounds</a></p></div>
+      <div class="prose" data-od-id="body">
+        <h2>The lane</h2>
+        <p>HRX is AMD&rsquo;s IREE-derived runtime &mdash; Loom source-first kernels JIT-compiled for the XDNA 2 NPU. We spent this month turning it from a platform-transition watch into an actual execution lane for our own models: the Q4NX tile format (4-bit int4 + BF16 scales, 5120-byte tiles) that our engine uses natively, executed on the NPU.</p>
+        <p>The final model: <span class="mono">Zyphra ZAYA1-8B</span>, 8.84&nbsp;B params, <span class="mono">6.96&nbsp;GiB</span> (6.76&nbsp;BPW). Every quantized op runs on the HRX2 backend of our llama.cpp fork at <span class="mono">-ngl 99</span>.</p>
+
+        <h2>Milestones</h2>
+        <table>
+          <thead><tr><th>milestone</th><th>what it took</th><th>result</th></tr></thead>
+          <tbody>
+            <tr><td>First Q4NX model served</td><td>qwen3-0.6B end-to-end on gfx1151; every layer of the chain validated (op-level 3.7e-7)</td><td>pipeline proven</td></tr>
+            <tr><td>Quality fix</td><td>the fused mm kernel silently transposed every multi-token matmul (row-major vs ggml col-major)</td><td>real tokens</td></tr>
+            <tr><td>Zaya port &mdash; architecture root cause</td><td>the graph ran alternating attn/MoE blocks and ignored half the weights; rewritten to HF&rsquo;s both-blocks-per-layer</td><td>8/8 top-1 vs HF</td></tr>
+            <tr><td>Zaya Q4NX + MoE dispatch</td><td>new <span class="mono">MUL_MAT_ID_Q4NX</span> op for the stacked experts; root cause: the dispatch read the strided topk view contiguously</td><td>corr 0.99999999</td></tr>
+            <tr><td>7&ndash;17&times; speedup</td><td>per-tile 3-copy upload (&asymp;9,200 stream ops/token) collapsed to one raw-blob copy + a tile-major dequant kernel</td><td>tg 1.22 &rarr; 8.7 t/s</td></tr>
+            <tr><td>llama-server</td><td>the HTTP lane: prompt 18.1 / decode 8.16 t/s</td><td>servable</td></tr>
+          </tbody>
+        </table>
+
+        <h2>The numbers</h2>
+        <table>
+          <thead><tr><th>measure</th><th>value</th></tr></thead>
+          <tbody>
+            <tr><td>logits corr vs F32 port</td><td>0.99999999</td></tr>
+            <tr><td>max |dlogit|</td><td>0.0041 &mdash; top-1 margin is 1,681&times; the noise</td></tr>
+            <tr><td>top-5 tokens</td><td>identical to F32</td></tr>
+            <tr><td>F32 port vs HF greedy</td><td>8/8 top-1</td></tr>
+            <tr><td>prefill (pp32)</td><td>127.4 t/s (round 23)</td></tr>
+            <tr><td>decode (tg32)</td><td>13.0 t/s (round 23)</td></tr>
+            <tr><td>decode, pre-optimization</td><td>1.22 t/s (&asymp;11&times; faster now)</td></tr>
+            <tr><td>prefill, pre-optimization</td><td>2.1 t/s (&asymp;61&times; faster now)</td></tr>
+            <tr><td>llama-server prompt / decode</td><td>18.1 / 8.16 t/s</td></tr>
+          </tbody>
+        </table>
+
+        <h2>The bugs that were the work</h2>
+        <p>The two root causes worth remembering:</p>
+        <p><b>The architecture was wrong before the math was.</b> The Zaya port ran one block per layer (attention, then MoE, alternating) &mdash; HF runs both in every layer. Half the weights sat unused and the logits were uncorrelated with the reference (0.10). Fixing the graph &mdash; not the kernels &mdash; jumped straight to 8/8 top-1.</p>
+        <p><b>The ids are a strided view.</b> In the expert matmul, the per-token expert ids come from an argsort whose output is a strided view (17 sorted experts per token, <span class="mono">nb[1] = 17&times;4</span>). The NPU dispatch copied them contiguously, so token 2 silently received the second-best expert of token 0. The F32 path read the strides correctly &mdash; which is exactly why the port &ldquo;worked&rdquo; on CPU and broke on the NPU. One stride-aware copy fixed the whole model.</p>
+
+        <h2>Why 0.99999999 and not 1.0</h2>
+        <p>Because the two runs sum the same math in different orders. The weights are bit-identical between the Q4NX and F32 models; the last 1e-8 of correlation is float32 rounding between the NPU reduction tree and the CPU one &mdash; 1,681&times; below the top-1 margin. It rounds to 1.00000000 and the output is identical.</p>
+
+        <h2>What&rsquo;s next (rounds 24&ndash;28)</h2>
+        <p><b>The converter went general.</b> <span class="mono">make-q4nx-model.py</span> now reads the architecture from any GGUF, quantizes Q4_K/Q5_K/Q6_K/Q8_0/F16/BF16 sources to Q4NX (numpy dequant ports verified bit-exact vs ggml), handles MoE 3-D expert tensors and per-type keep shapes. The whole local roster was converted and validated on HRX20: Qwen3-0.6B, Qwen2.5-3B/0.5B, MiniCPM5-1B, MiniCPM4-8B generate coherently; the two MoE models (Qwen3-Coder-30B-A3B, GLM-4.7-Flash) now run their expert matmuls on the NPU; Qwen3-Next-80B runs too &mdash; it needed the pointwise ncols caps raised to 1M (the recurrent-state SCALE builds 524288-wide views in the worst-case reserve graph), and now says &ldquo;Paris.&rdquo; like its Q4_K reference.</p>
+        <p><b>The MoE bug that looked like noise.</b> The first MoE runs were complete garbage while every sub-component verified (per-pair mm corr 0.998, down mm corr 1.0000). Layer 0 was fine but layer 1&rsquo;s input had already drifted to corr 0.63. Root cause: <span class="mono">MUL_MAT_ID</span> treated src1 as the shared form <span class="mono">[k, ntokens]</span> (gate/up experts) for every dispatch &mdash; the down experts feed a <b>per-expert</b> src1 <span class="mono">[k, n_expert_used, ntokens]</span>, and the old code always read column <span class="mono">t&middot;k</span>: every expert silently computed with expert-0&rsquo;s activation. The &ldquo;corr 1.0000&rdquo; down check passed precisely because it replicated the bug. Fixed (fork 49f07b6): per-slot src1 columns <span class="mono">(i + t&middot;n_expert_used)</span> through both the grouped tables and the per-pair path, plus a new <span class="mono">src1_cols_count</span> config in the two table-scatter kernels. Down MMID now corr 1.0000 vs numpy (L0/L1/L10/L47); the 30B Q4NX matches the Q4_K_M reference nearly token-for-token &mdash; &ldquo;The capital of France is&rdquo; &rarr; &ldquo;Paris.&rdquo; for both.</p>
+        <p><b>Numbers on the fixed 30B MoE</b> (HRX20, -t 16, ngl 99): pp32 49.2 t/s, pp128 67.5 t/s, tg32 14.3 t/s. An external iGPU reference on the same SoC (Q4_K_M, Vulkan) decodes the 30B-A3B at 86.1 t/s &mdash; the iGPU stays ahead at small-batch decode; the NPU&rsquo;s edge remains memory (6.96 vs 32.93 GiB) and large-batch prefill (zaya pp512 171 t/s).</p>
+        <p><b>Round 25d</b> found a silent prefill regression: the per-expert src1 fix added a required <span class="mono">src1_cols_count</span> config to the fused tbl kernel, but the dense prefill path never passed it &mdash; every dense matmul failed the JIT compile and quietly fell back to the slow dequant+mm slice. One config line restored it: pp32 3B 82 &rarr; 121.5 t/s (+47%), 0.6B 208 &rarr; <b>435.8</b> (2.1&times;), MiniCPM4-8B 33 &rarr; 51. A <span class="mono">provider_compile failed</span> trace is what exposes this class of silent fallback.</p>
+        <p><b>Final roster</b> (Q4NX on HRX20, sequential &mdash; concurrent benches fight over the NPU):</p>
+        <table>
+          <thead><tr><th>model</th><th>pp32</th><th>tg32</th><th>tg32 (25i zero-copy)</th></tr></thead>
+          <tbody>
+            <tr><td>Qwen3-0.6B</td><td>435.8</td><td>42.3</td><td><b>63.0</b></td></tr>
+            <tr><td>Qwen2.5-3B</td><td>121.5</td><td>23.3</td><td><b>26.7</b></td></tr>
+            <tr><td>Qwen2.5-7B</td><td>55.2</td><td>11.7</td><td><b>13.7</b></td></tr>
+            <tr><td>MiniCPM4-8B</td><td>51.1</td><td>10.4</td><td><b>11.9</b></td></tr>
+            <tr><td>GLM-4.7 (30B-A3B MoE)</td><td>49.9</td><td>12.95</td><td><b>14.8</b></td></tr>
+            <tr><td>Qwen3-Coder-30B (MoE)</td><td>49&ndash;50</td><td>14.3&ndash;15.5</td><td><b>18.3</b></td></tr>
+            <tr><td>Qwen3-Next-80B (MoE)</td><td>32.2</td><td>7.2</td><td><b>7.9</b></td></tr>
+          </tbody>
+        </table>
+        <p><b>Round 25h</b> landed the deferred 16-row decode kernel: a workgroup of 16 rows &times; 1 col with 256 lanes split 16&times;16 over rows &times; k-blocks, so each k-step reads <b>8 contiguous packed bytes</b> instead of the per-pair kernel&rsquo;s 1-byte stride-8 reads. tg32: 3B 20.6&rarr;23.3 (+13%), 8B 9.0&rarr;10.4 (+16%), GLM 12.5&rarr;12.95; decode stays bandwidth-bound at ~49 GB/s effective.</p>
+        <p><b>Round 25i &mdash; TRUE zero-DMA-copy.</b> The CPU&harr;NPU boundary is now copy-free: activations live in host-visible GTT shared by both sides, weights stay device-local (the loader is forced onto a device-local extra buft), and only ~128&nbsp;bytes of graph input cross per eval. Full-hybrid op claims plus generic JIT <span class="mono">rms_norm</span>/<span class="mono">soft_max</span> routes keep the CPU out of the shared-memory hot path entirely &mdash; if the CPU computes into GTT, the NPU reads those pages slowly (cache-coherency tax over the fabric), so &ldquo;CPU never touches shared memory&rdquo; is the design rule. Decode wins across the roster (+10&ndash;49%, right column); prefill (pp32) regressed on this NPU (3B 121.5&rarr;27.8) because the attention KQ&sup1;/kqv F32 matmuls are still CPU-side and write into shared GTT &mdash; the documented cost of shared-memory zero-copy until those move to HRX2 (strided GQA batched kernel, scaffolding already in the fork).</p>
+                <p><b>Round 25j &mdash; the attention matmuls moved to HRX2 and the prefill coherency tax is gone (pp32 up to 3.4&times;).</b> The remaining CPU ops in the zero-copy prefill path were the attention KQ&sup1;/kqv matmuls plus ROPE and GLU &mdash; every one of them wrote into shared GTT and the NPU paid cross-snoop coherency on read-back (3B pp32 27.8). The matmuls turned out to be F16&times;F32 (K/V come from the F16 KV cache), and an <i>existing</i> complete kernel already handled exactly that (<span class="mono">mul_mat_f16_f32_batched</span>: strided GQA batched views, broadcast) &mdash; it just was never claimed. Claiming it exposed a real loom bug: the src0 view bound omitted the <span class="mono">(src0_ne2-1)&middot;stride_ne2</span> term, so with GQA the JIT correctly rejected the shape (&ldquo;view.load scalar footprint upper bound is not proven&rdquo;, kqv 32768 vs needed 65536 elements). Fixed in all four kernel variants. The dispatch trace then showed the matmuls were only ~10&nbsp;ms of 2.9&nbsp;s &mdash; the real tax was uncovered <b>ROPE</b> (K-rope h2 had no routes at all; Q-rope t8/t32 missing) and <b>split GLU</b> (ncols=11008 uncovered). Added generic <span class="mono">rope_neox_f32</span>/<span class="mono">freq</span> and <span class="mono">swiglu_f32_split</span> routes; only 12 embedding lookups stay on CPU. The cols8 batched-mm route domain was widened (cols 8&ndash;512) so wide-head models (30B, 32 heads) get the 8-cols-per-workgroup kernel instead of the 1-output-per-workgroup generic (30B pp32 41.8 &rarr; 47.1, matching the CPU-attention baseline while staying on NPU), and the stride config decls were widened to 2<sup>30</sup> so llama-cli decode shapes JIT-compile. Result: the 3B prefill regression is fully recovered (27.8 &rarr; 81.3, vs 121.5 pre-zero-copy) and decode is still up everywhere.</p>
+        <table>
+          <thead><tr><th>model</th><th>pp32 (25i)</th><th>pp32 (25j)</th><th>tg32 (25i)</th><th>tg32 (25j)</th></tr></thead>
+          <tbody>
+            <tr><td>Qwen2.5-0.5B</td><td>180</td><td><b>617</b></td><td>84.5</td><td>80.5</td></tr>
+            <tr><td>Qwen3-0.6B</td><td>211</td><td><b>461</b></td><td>63.0</td><td>81.9</td></tr>
+            <tr><td>Qwen2.5-3B</td><td>27.8</td><td><b>81.3</b></td><td>26.7</td><td>29.5</td></tr>
+            <tr><td>MiniCPM5-1B</td><td>&mdash;</td><td>325</td><td>&mdash;</td><td>69.7</td></tr>
+            <tr><td>Qwen2.5-7B</td><td>29.9</td><td>30.3</td><td>13.7</td><td>14.1</td></tr>
+            <tr><td>GLM-4.7 (30B-A3B MoE)</td><td>39.9</td><td>43.1</td><td>14.8</td><td>15.7</td></tr>
+            <tr><td>MiniCPM4-8B</td><td>24.3</td><td>24.4</td><td>11.9</td><td>12.2</td></tr>
+            <tr><td>Qwen3-Coder-30B (MoE)</td><td>47.7</td><td>47.1</td><td>18.3</td><td>18.8</td></tr>
+            <tr><td>Qwen3-Next-80B (MoE)</td><td>32.6</td><td>32.7</td><td>7.9</td><td>8.0</td></tr>
+          </tbody>
+        </table>
+        <p><b>Round 25n &mdash; generic norm fusions: prefill is launch-bound, pp32 +33%.</b> Decode-trace forensics corrected a wrong model: the per-dispatch <span class="mono">elapsed_us</span> is only host submit time (~1&nbsp;&micro;s) &mdash; the real GPU execution hides inside <span class="mono">hrx_stream_synchronize</span>. Fitting time/token vs model size across 0.5B/3B/7B gives decode = 3.7&nbsp;ms fixed + weights @ <b>65&nbsp;GB/s</b>: decode is weight-bandwidth-bound, so kernel count is irrelevant there. Prefill is the opposite &mdash; launch-bound at ~31&nbsp;&micro;s per dispatch &mdash; so cutting dispatch count is the lever. The ADD&rarr;RMS_NORM&rarr;MUL and RMS_NORM&rarr;MUL fusion routes existed but never fired on the 3B: they only covered ncols=3072/4096 while n_embd=2048 was uncovered (same route-coverage class as 25j&rsquo;s ROPE/GLU). Added generic <span class="mono">rms_norm_mul</span> + <span class="mono">add_rms_norm_mul</span> routes (ncols 1&ndash;65536); pp32 dispatches per graph ~2600 &rarr; 2028. Two gotchas: the kernels need the <span class="mono">vector_width=4</span> tuning binding (my first generic append omitted it &rarr; JIT CONFIG/INVALID), and the route JSONs are hand-formatted with compact arrays &mdash; append text-level in the original style, json.dump reformats the whole file.</p>
+        <table>
+          <thead><tr><th>model</th><th>pp32 (25j)</th><th>pp32 (25n)</th><th>tg32 (25j)</th><th>tg32 (25n)</th></tr></thead>
+          <tbody>
+            <tr><td>Qwen2.5-0.5B</td><td>617</td><td><b>652</b></td><td>80.5</td><td>89.7</td></tr>
+            <tr><td>Qwen3-0.6B</td><td>461</td><td><b>523</b></td><td>81.9</td><td>85.2</td></tr>
+            <tr><td>Qwen2.5-3B</td><td>81.3</td><td><b>108.3</b></td><td>29.5</td><td>30.1</td></tr>
+            <tr><td>MiniCPM5-1B</td><td>325</td><td>&mdash;</td><td>69.7</td><td>&mdash;</td></tr>
+            <tr><td>Qwen2.5-7B</td><td>30.3</td><td><b>38.5</b></td><td>14.1</td><td>14.2</td></tr>
+            <tr><td>GLM-4.7 (30B-A3B MoE)</td><td>43.1</td><td><b>48.9</b></td><td>15.7</td><td>16.4</td></tr>
+            <tr><td>MiniCPM4-8B</td><td>24.4</td><td><b>31.9</b></td><td>12.2</td><td>12.1</td></tr>
+            <tr><td>Qwen3-Coder-30B (MoE)</td><td>47.1</td><td><b>54.3</b></td><td>18.8</td><td>19.7</td></tr>
+            <tr><td>Qwen3-Next-80B (MoE)</td><td>32.7</td><td>&mdash;</td><td>8.0</td><td>&mdash;</td></tr>
+          </tbody>
+        </table>
+        <p><b>Round 25o &mdash; the r16x8 fused prefill matmul: 16 rows &times; 8 cols per workgroup &mdash; pp32 roughly doubled.</b> Prefill-mm forensics found the <span class="mono">tbl_tiled</span> kernel does <b>1 row &times; 8 cols per workgroup</b>: for the 3B gate mm (11008 rows) that is 44,032 workgroups re-reading scales/zeros per k element at 1-row granularity. Workgroup-size A/B (256/512/1024 &rarr; 108/95/58 t/s) and routing prefill through the decode r16 kernel (57 t/s &mdash; each column workgroup re-reads all weights) ruled out launch count and pinned the limit on the 1-row-per-workgroup structure. The new <span class="mono">hrx2_mul_mat_q4nx_fused_f32_r16x8</span> kernel adapts the r16 decode kernel (16 rows/workgroup, 256 lanes = 16 rows &times; 16 k-blocks, 8-byte coalesced packed reads) to process <b>8 output columns per workgroup</b>: each lane walks its row&rsquo;s k-chunk once and feeds 8 matmuls &mdash; one packed-byte stream, 8 src1 loads + 8 MACs per k &mdash; so workgroups drop from rows &times; cols/8 to rows/16 &times; cols/8 (gate: 44,032 &rarr; 2,752). Per-row reduction over the 16 k-block lanes uses workgroup scratch (phase 2: lanes 0..127 sum 16 kb-partials each). Dense identity columns only (MoE keeps the table-scatter path). Dispatch requires cols&nbsp;%&nbsp;8&nbsp;==&nbsp;0 and rows&nbsp;%&nbsp;16&nbsp;==&nbsp;0 &mdash; the column guard is essential: indexing src1 at col_group&middot;8+7 reads past the view on non-multiple-of-8 shapes (llama-cli&rsquo;s 33-token batch JIT-rejected them until the guard landed).</p>
+        <table>
+          <thead><tr><th>model</th><th>pp32 (25n)</th><th>pp32 (25o)</th><th>tg32 (25n)</th><th>tg32 (25o)</th></tr></thead>
+          <tbody>
+            <tr><td>Qwen2.5-0.5B</td><td>652</td><td><b>835</b></td><td>89.7</td><td>82.7</td></tr>
+            <tr><td>Qwen3-0.6B</td><td>523</td><td><b>786</b></td><td>85.2</td><td>84.6</td></tr>
+            <tr><td>Qwen2.5-3B</td><td>108</td><td><b>229</b></td><td>30.1</td><td>29.4</td></tr>
+            <tr><td>Qwen2.5-7B</td><td>38.5</td><td><b>98.0</b></td><td>14.2</td><td>14.2</td></tr>
+            <tr><td>GLM-4.7 (30B-A3B MoE)</td><td>48.9</td><td>53.3</td><td>16.4</td><td>16.2</td></tr>
+            <tr><td>MiniCPM4-8B</td><td>31.9</td><td><b>78.5</b></td><td>12.2</td><td>12.1</td></tr>
+            <tr><td>Qwen3-Coder-30B (MoE)</td><td>54.3</td><td>54.2</td><td>19.7</td><td>18.0</td></tr>
+            <tr><td>Qwen3-Next-80B (MoE)</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td></tr>
+          </tbody>
+        </table>
+        <p><b>Round 25p &mdash; the MoE boulder moved: the r16x8t table-scatter kernel, grouped prefill +21&ndash;33%.</b> Round 25o tripled dense prefill but the MoE models barely moved &mdash; GLM-4.7 and Qwen3-Coder-30B route their expert matmuls through the grouped path (<span class="mono">slice_grouped</span>), which still used the 1-row-per-workgroup <span class="mono">tbl_tiled</span> kernel with i32 table scatter. GLM&rsquo;s pp32 trace shows why: <b>9,453 grouped dispatches per graph</b> (vs 652 dense), each ~80&nbsp;&micro;s serialized &mdash; groups are small (rows 1536/2048, cols 2..7), so every group launches rows&times; workgroups to compute a handful of columns. The new <span class="mono">hrx2_mul_mat_q4nx_fused_f32_r16x8t</span> kernel gives the fused tbl the r16x8 structure &mdash; 16 rows &times; 8 columns per workgroup, 256 lanes as 16 rows &times; 16 k-blocks, one packed-byte stream feeding 8 table-scattered matmuls, per-row scratch reduction &mdash; so workgroups drop from rows&times; to rows/16&times;. Two real bugs surfaced: the phase-2 reduction indexed its 16 k-block partials kb-major while lanes are row-major (&rarr; garbage on GLM until fixed to <span class="mono">row_reduce + kk2&middot;16</span>), and the route-binding validator whitelists only <span class="mono">shape.mul_mat_id.*</span> sources while <span class="mono">src1_cols_count</span> must ride the dispatch config, not a binding. Result: MoE grouped prefill 30B 54.2&rarr;<b>71.9</b> (+33%), GLM 53.3&rarr;<b>64.7</b> (+21%); dense untouched (r16x8 still serves it) and decode flat as designed. Greedy generations verified identical vs the old path on GLM and 30B (multi-prompt batteries); the 30B poem-prompt degeneration reproduces on the pre-25p build too &mdash; a pre-existing chaotic divergence, not a regression.</p>
+        <table>
+          <thead><tr><th>model</th><th>pp32 (25o)</th><th>pp32 (25p)</th><th>tg32 (25o)</th><th>tg32 (25p)</th></tr></thead>
+          <tbody>
+            <tr><td>Qwen2.5-3B</td><td>229</td><td>229.7</td><td>29.4</td><td>29.8</td></tr>
+            <tr><td>Qwen2.5-7B</td><td>98.0</td><td>97.6</td><td>14.2</td><td>14.1</td></tr>
+            <tr><td>GLM-4.7 (30B-A3B MoE)</td><td>53.3</td><td><b>64.7</b></td><td>16.2</td><td>16.3</td></tr>
+            <tr><td>Qwen3-Coder-30B (MoE)</td><td>54.2</td><td><b>71.9</b></td><td>18.0</td><td>19.7</td></tr>
+            <tr><td>MiniCPM4-8B</td><td>78.5</td><td><b>80.0</b></td><td>12.1</td><td>12.2</td></tr>
+          </tbody>
+        </table>
+        <p><b>Round 25q &mdash; the decode &ldquo;65&nbsp;GB/s wall&rdquo; was never the memory path: the r16w wide-read kernel, tg32 3B +72%, 7B +89%.</b> The standing decode model said time/token = 3.7&nbsp;ms fixed + weights @ <b>65&nbsp;GB/s</b>, and 25h guessed the ceiling was &ldquo;the NPU&rsquo;s actual memory path&rdquo;. Round 25q falsified that with a load-only probe: dispatching the <i>dense f32 mm kernel</i> on the same device-local weight buffer reads at <b>205&ndash;219&nbsp;GB/s cold</b> (8-slice rotating ring), while the q4nx r16 decode kernel reads the same memory at only 64&ndash;74&nbsp;GB/s cold &mdash; the gap was the access pattern, not the fabric (~3&times; headroom existed). Compiler evidence matched: r16&rsquo;s inner body issues six 1&ndash;4 byte scalar loads per lane per k-step; the f32 kernel issues 4B/lane contiguous (~1&nbsp;KB per instruction). The new <span class="mono">hrx2_mul_mat_q4nx_fused_f32_r16w</span> kernel restructures decode around the packed layout&rsquo;s contiguous axis &mdash; 8 bytes at one k-position hold all 16 rows of a half-tile &mdash; so each of the 256 lanes owns ONE k-position and ALL 16 output rows of the workgroup: per tile-column the wavefront reads <b>2&nbsp;KB contiguous</b> (256 lanes &times; 8B). 16 f32 row accumulators per lane; scales/zeros staged cooperatively into 512&nbsp;B of workgroup LDS once per tile-column (cutting 64 &times; 1B global scale loads to 2 per lane); 16 <span class="mono">workgroup.reduce</span>s produce the outputs; signed-nibble decode is branchless. One real bug: the dispatch&rsquo;s workgroup-count expression special-cased r16 (<span class="mono">rows/16</span>) but fell through to <span class="mono">rows</span> for r16w &mdash; 16&times; too many workgroups reading past their slice (memory fault, caught by the real-model A/B the probe could not see).</p>
+        <table>
+          <thead><tr><th>model</th><th>tg32 (r16)</th><th>tg32 (r16w)</th></tr></thead>
+          <tbody>
+            <tr><td>Qwen2.5-3B</td><td>29.8</td><td><b>51.2</b> (+72%)</td></tr>
+            <tr><td>Qwen2.5-7B</td><td>14.0</td><td><b>26.5</b> (+89%)</td></tr>
+            <tr><td>MiniCPM4-8B</td><td>12.1</td><td><b>21.7</b> (+79%)</td></tr>
+            <tr><td>GLM-4.7 (30B-A3B MoE)</td><td>16.4</td><td><b>19.9</b> (+21%)</td></tr>
+            <tr><td>Qwen3-Coder-30B (MoE)</td><td>19.9</td><td><b>25.7</b> (+29%)</td></tr>
+          </tbody>
+        </table>
+<p><b>Round 26 &mdash; the twin: the gap is summation order, now proven.</b> The &ldquo;Why 0.99999999 and not 1.0&rdquo; claim above was asserted; round 26 proved it. We built a lossless F32 <i>twin</i> of the Q4NX model: every Q4NX tensor dequantized to F32 holding the <i>same numeric values</i> (<span class="mono">W = q4&middot;scale + zp</span>, per-(row, 32-col) bf16 scales/zeros, 35.4 GB output). If the NPU executes the quantized graph exactly, corr(Q4NX, twin) &asymp; 1.0; if the gap persists against the twin, it is execution &mdash; not quantization. The twin-vs-F32 comparison (corr 0.999999, maxdiff 4.4e-2) confirms the dequant is faithful, yet the NPU-vs-twin gap (corr 0.999973, maxdiff 0.24) is statistically identical to the NPU-vs-F32 gap. Top-1 and top-10 are identical on all three. The residual is pure f32 summation order between the NPU&rsquo;s 256-lane reduction trees and the CPU order, amplified by the 32-token recurrence &mdash; <b>not</b> the 4-bit weights. Deterministic corr(32-tok) = 1.0 remains the fixed-point pipeline&rsquo;s property (the 1BP reader reconstructs <span class="mono">W = q4&middot;s + zp</span> byte-exact: 0/3,145,728 mismatches vs the engine&rsquo;s own dequant; the <span class="mono">(q4&middot;16&middot;rq + zpq) &gt;&gt; 22</span> re-quant matches int8 to rounding boundaries only).</p>
+        <p><b>Round 27 &mdash; the real model on the NPU.</b> The actual ROCm/FastFlowLM runtime (Qwen3-0.6B, the same Q4NX tile format) now runs end-to-end on the XDNA 2 NPU: prompt &ldquo;Hello&rdquo; &rarr; 146-token reply, prefill 27.8&rarr;29.6 t/s, decode 96.6&rarr;92.8 t/s, zero IO_PAGE_FAULTs and zero TDRs. Two things made the hand-rolled launcher deadlock while the real runtime works: (1) the runtime generates the layer instruction stream <i>with the real weights loaded</i> and sizes the BOs to match &mdash; our weight-less dump and guessed BOs meant the shim-DMA sync tokens never fired; (2) the amdxdna kernel ABI is <span class="mono">(opcode, instr_bo, ninstr, bo0..boN)</span> &mdash; without the instruction buffer the ERT command reports COMPLETED but the AIE never executes (a <b>silent no-op</b>, proven with sentinel buffers). Feeding the insts and binding each BO to its kernel-argument slot via the BO group id makes the same xclbin execute deterministically, input- and weight-offset-sensitively. We also reverse-engineered the tile dequant against the runtime&rsquo;s own library: <b><span class="mono">W = (q &minus; zp) &middot; scale</span></b> (group-major bf16 scales/zeros, lane-swizzled nibbles) &mdash; maxdiff 0.0 over the whole projection, the only residual one BF16 ULP from the weight BO.</p>
+        <p><b>Round 28 &mdash; the engine matched the real runtime byte-for-byte: corr 1.000000.</b> The hand-rolled NPU launcher&rsquo;s prefill logits are now <b>byte-identical</b> to the real FastFlowLM runtime on the same xclbin: for the token-1000 input, corr <b>1.000000</b>, argmax 397&nbsp;==&nbsp;397, top-5 identical [397, 3219, 144370, 42044, 255], verified by dumping the engine&rsquo;s prefill logits (NPU_LOGITS_DUMP) and diffing against the runtime&rsquo;s <span class="mono">logits_1000.bin</span>. Decode runs at ~15&nbsp;ms/tok on Qwen3-0.6B/XDNA&nbsp;2. This closes the &ldquo;why 0.99999999 and not 1.0&rdquo; question from round 26 in the strongest way: the engine executes the <i>same</i> instruction stream as AMD&rsquo;s own runtime and produces the <i>same</i> bytes &mdash; the residual corr gap that remained in the llama.cpp lane is summation order between reduction trees, not the Q4NX math. The fix trail that got here: the amdxdna ABI needs the <span class="mono">(opcode, instr_bo, ninstr, bo0..boN)</span> instruction buffer (without it the ERT reports COMPLETED but the AIE never executes &mdash; a silent no-op proven with sentinel buffers), each host BO must be created with its kernel-argument group id (group-0 BOs are ignored and can wedge the NPU with IO_PAGE_FAULTs), and the Q4NX dequant is <span class="mono">W = (q &minus; zp) &middot; scale</span> (group-major bf16 scales/zeros, lane-swizzled nibbles) &mdash; maxdiff 0.0 over the whole projection.</p>
+        <h2>One pool, one API call, zero copies</h2>
+        <p><b>We reverse-engineered how the Windows NPU stack does memory &mdash; then matched it on Linux.</b> The control plane was already unified (one process, one OpenAI-compatible API, every model resident); what was missing was the Windows-style memory + dispatch model underneath. Windows (MCDM, <span class="mono">ipustack.sys</span>) hands every process <i>one</i> device heap and submits with <i>one</i> chained command message (<span class="mono">CHAIN_EXEC_DPU</span>) &mdash; a front-end to the <i>same</i> NPU firmware as Linux <span class="mono">amdxdna</span>, opcode tables matching. Portable, not proprietary: the Linux kernel already had the device-heap carve (<span class="mono">amdxdna_drm_create_dev_heap</span>) and the chained <span class="mono">EXEC_CMD</span>; the gap was userspace. We closed it &mdash; one 64&nbsp;MB heap (every tensor a slice carved by the kernel&rsquo;s own drm_mm) and <b>one <span class="mono">EXEC_CMD</span> per layer</b> carrying the whole command chain (QKV, O, GU, D) as a single mailbox message. Probe-verified end-to-end on kernel 7.1.5; the real-kernel path is built against Qwen3-0.6B&rsquo;s actual instruction stream and q4nx weights.</p>
+        <p><b>And the pages are shared, not copied.</b> Models sit in a unified memory pool (<span class="mono">SharedBO</span>) &mdash; NPU-owned, GPU-imported, host-coherent: one set of physical pages, three views, no staging DMA. Proven both directions (dma-buf round trip, 0 mismatches), and in production form by a Vulkan shader reading the NPU&rsquo;s KV pages straight out of the pool (rel err 2e-4). The rule that makes it safe: <b>the NPU owns the pages</b> &mdash; reverse the ownership and AMD-Vi faults. GPU import is Vulkan (<span class="mono">VK_KHR_external_memory_fd</span>); the installed TheRock HIP has no dma-buf import path, so that route is the one that works.</p>
+      </div>
+    
+    <section class="related">
+      <h2>Related</h2>
+      <a href="https://1bit.monster/1bit-post-npu-reversal.html">I reverse-engineered AMD's NPU stack in 4 days</a>
+      <a href="https://1bit.monster/1bit-post-halo-reviews.html">What the Ryzen AI Halo reviews didn't tell you</a>
+      <a href="https://1bit.monster/1bit-benchmarks.html">Benchmarks</a>
+    </section>
+  </article>
+  </main>
+
+  <footer class="pagefoot" data-od-id="footer">
+    <div class="container row-between" style="max-width: 1000px;">
+      <span>© 2026 1bit.MONSTER · MIT License</span>
+      <a class="meta" href="https://discord.gg/Qy38d4Xu2h" target="_blank" rel="noopener">Join Discord &#8599;</a>
+
+      <a class="meta" href="https://github.com/1bit-MONSTER/1bit-MONSTER">github.com/1bit-MONSTER</a>
+    </div>
+    <div class="container">
+      <p class="place" data-od-id="footer-place">Metepenagiag Mi’kmaq Nation, New Brunswick, Canada</p>
+      <p class="quote" data-od-id="footer-quote">"Sorry but not sorry." by bong-water-water-bong</p>
+    </div>
+  </footer>
+<script src="analytics.js"></script>
+<script src="https://context7.com/widget.js" data-library="/1bit-monster/1bit-monster"></script>
+</body>
+</html>

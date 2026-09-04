@@ -7,20 +7,20 @@
   <link rel="icon" type="image/png" sizes="32x32" href="assets/favicon-32x32.png">
   <link rel="icon" type="image/png" sizes="16x16" href="assets/favicon-16x16.png">
   <link rel="apple-touch-icon" href="assets/apple-touch-icon.png">
-  <title>DSpark speculative decoding, disproven | 1bit.MONSTER</title>
-  <meta name="description" content="Milestone: a speculative-decoding method that promised 572 tok/s delivered ~0.1-0.2 tok/s — disproven with measurements, and what it would take to fix. Full technical write-up: https://github.com/1bit-MONSTER/1bit-MONSTER/blob/main/spec-decode/README.md" />
+  <title>HRX: we put AMD's experimental IREE runtime inside our engine | 1bit.MONSTER</title>
+  <meta name="description" content="Milestone: AMD's experimental NPU runtime now runs inside our engine — one process, two runtimes, roughly twice the warm decode, with the honest ceiling measured. Full technical write-up: https://github.com/1bit-MONSTER/1bit-MONSTER/blob/main/docs/research/hrx-backend.md" />
   <meta property="og:site_name" content="1bit.MONSTER" />
   <meta property="og:type" content="article" />
-  <meta property="og:title" content="DSpark speculative decoding, disproven | 1bit.MONSTER" />
-  <meta property="og:description" content="Milestone: a speculative-decoding method that promised 572 tok/s delivered ~0.1-0.2 tok/s — disproven with measurements, and what it would take to fix. Full technical write-up: https://github.com/1bit-MONSTER/1bit-MONSTER/blob/main/spec-decode/README.md" />
-  <meta property="og:url" content="https://1bit.monster/1bit-post-dspark.html" />
+  <meta property="og:title" content="HRX: we put AMD's experimental IREE runtime inside our engine" />
+  <meta property="og:description" content="Milestone: AMD's experimental NPU runtime now runs inside our engine — one process, two runtimes, roughly twice the warm decode, with the honest ceiling measured. Full technical write-up: https://github.com/1bit-MONSTER/1bit-MONSTER/blob/main/docs/research/hrx-backend.md" />
+  <meta property="og:url" content="https://1bit.monster/1bit-post-hrx-engine.html" />
   <meta property="og:image" content="https://1bit.monster/assets/og-card.png" />
   <meta name="twitter:card" content="summary_large_image" />
-  <meta name="twitter:title" content="DSpark speculative decoding, disproven | 1bit.MONSTER" />
-  <meta name="twitter:description" content="Milestone: a speculative-decoding method that promised 572 tok/s delivered ~0.1-0.2 tok/s — disproven with measurements, and what it would take to fix. Full technical write-up: https://github.com/1bit-MONSTER/1bit-MONSTER/blob/main/spec-decode/README.md" />
+  <meta name="twitter:title" content="HRX: we put AMD's experimental IREE runtime inside our engine" />
+  <meta name="twitter:description" content="Milestone: AMD's experimental NPU runtime now runs inside our engine — one process, two runtimes, roughly twice the warm decode, with the honest ceiling measured. Full technical write-up: https://github.com/1bit-MONSTER/1bit-MONSTER/blob/main/docs/research/hrx-backend.md" />
   <meta name="twitter:image" content="https://1bit.monster/assets/og-card.png" />
-  <link rel="canonical" href="https://1bit.monster/1bit-post-dspark.html" />
-  <style>
+  <link rel="canonical" href="https://1bit.monster/1bit-post-hrx-engine.html" />
+<style>
     /* ─── tokens ─────────────────────────────────────────────────────────
        Bound verbatim to the locked light modern-minimal + 1-bit identity. */
     :root {
@@ -304,7 +304,7 @@
 
 </style>
   <script type="application/ld+json">
-  {"@context": "https://schema.org", "@type": "BlogPosting", "headline": "DSpark speculative decoding, disproven | 1bit.MONSTER", "description": "Milestone: a speculative-decoding method that promised 572 tok/s delivered ~0.1-0.2 tok/s — disproven with measurements, and what it would take to fix. Full technical write-up: https://github.com/1bit-MONSTER/1bit-MONSTER/blob/main/spec-decode/README.md", "url": "https://1bit.monster/1bit-post-dspark.html", "mainEntityOfPage": "https://1bit.monster/1bit-post-dspark.html", "image": "https://1bit.monster/assets/og-card.png", "datePublished": "2026-08-22", "dateModified": "2026-08-25", "author": {"@type": "Organization", "name": "1bit.MONSTER", "url": "https://1bit.monster"}, "publisher": {"@type": "Organization", "name": "1bit.MONSTER", "url": "https://1bit.monster"}}
+  {"@context": "https://schema.org", "@type": "BlogPosting", "headline": "HRX: we put AMD's experimental IREE runtime inside our engine | 1bit.MONSTER", "description": "Milestone: AMD's experimental NPU runtime now runs inside our engine — one process, two runtimes, roughly twice the warm decode, with the honest ceiling measured. Full technical write-up: https://github.com/1bit-MONSTER/1bit-MONSTER/blob/main/docs/research/hrx-backend.md", "url": "https://1bit.monster/1bit-post-hrx-engine.html", "mainEntityOfPage": "https://1bit.monster/1bit-post-hrx-engine.html", "image": "https://1bit.monster/assets/og-card.png", "datePublished": "2026-08-29", "dateModified": "2026-08-29", "author": {"@type": "Organization", "name": "1bit.MONSTER", "url": "https://1bit.monster"}, "publisher": {"@type": "Organization", "name": "1bit.MONSTER", "url": "https://1bit.monster"}}
   </script>
 
   <script src="theme.js"></script>
@@ -346,55 +346,90 @@
   </header>
 
   <main id="content">
-    <article class="art container" data-od-id="post-dspark">
+    <article class="art container" data-od-id="1bit-post-hrx-engine">
       <a class="back" href="1bit-blog.html">&larr; all posts</a>
       <div class="art-meta">
-        <span>2026-07-06</span>
-        <span class="tag">spec-decode</span>
-        <span class="tag">npu</span>
-        <span class="tag corr">correction</span>
+        <span class="tag">hrx</span><span class="tag">engine</span>
+        <span>2026-08-29</span>
       </div>
-      <h1>DSpark speculative decoding, disproven</h1>
-      <p class="lead">DSpark was projected to hit 572 tok/s on Strix Halo. We measured it end to end on the NPU and the projection did not survive: 0.1 to 0.2 tok/s at 0% draft acceptance. Here is how and why, what it would take to fix, and why these figures are historical and unsourced.</p>
-
+      <h1>HRX: we put AMD's experimental IREE runtime inside our engine</h1>
+      <p class="lead">AMD calls HRX "a lighter, more focused subset of ROCm" — an IREE-based HIP replacement shipped as a self-contained llama.cpp bundle. This week it moved <b>inside our engine</b>: dlopen'd in-process, token-level decode on the HRX device, two llama.cpps in one process without them colliding, and warm decode at ~2× HIP on the models its fused kernels can run. Plus the ceiling we measured, and the honest reframe that goes with it.</p>
       
-      <div class="callout"><p><b>Milestone:</b> a speculative-decoding method that promised 572 tok/s delivered ~0.1-0.2 tok/s — disproven with measurements, and what it would take to fix. <a href="https://github.com/1bit-MONSTER/1bit-MONSTER/blob/main/spec-decode/README.md">Full technical write-up &rarr; spec-decode README</a></p></div>
-      <div class="prose" data-od-id="body">
+      <div class="callout"><p><b>Milestone:</b> AMD's experimental NPU runtime now runs inside our engine — one process, two runtimes, roughly twice the warm decode, with the honest ceiling measured. <a href="https://github.com/1bit-MONSTER/1bit-MONSTER/blob/main/docs/research/hrx-backend.md">Full technical write-up &rarr; HRX backend research</a></p></div>
+      <div class="prose">
+        <h2>What HRX actually is</h2>
+        <p>HRX — <b>Hip Runtime Extended</b> — is AMD's experiment at a lighter, more focused
+        subset of ROCm for client silicon (their words, in the upstream RFC). It's built on IREE
+        (LLVM MLIR) with a Loom kernel substrate, and AMD ships it as a self-contained llama.cpp
+        bundle: <span class="mono">libllama.so</span> + <span class="mono">libggml-hrx.so</span> +
+        <span class="mono">libhrx.so</span> + <span class="mono">libloomc.so</span>, no ROCm install
+        needed. We've run it as a subprocess backend for a week. This week it moved <b>into our
+        process</b>.</p>
 
-        <h2>The projection</h2>
-        <p>DSpark was projected to hit <span class="mono">572 tok/s</span> on Strix Halo. The number came out of a model: a draft pass assumed cheaper than the target, an acceptance rate assumed high enough to matter, latency assumed hidden behind the draft. It is the kind of figure that survives a spreadsheet and dies on hardware, and we took it to the NPU to check.</p>
-        <p>A projected speedup is a hypothesis, not a result. The only way to promote it is to measure it end to end, on the device, through the real engine.</p>
+        <h2>Two llama.cpps in one process</h2>
+        <p>The bundle ships a complete <span class="mono">llama.h</span> C API — 82 KB of it — and
+        our engine already links its own llama.cpp for the Vulkan backend. Two copies of an
+        unversioned C API in one binary is normally a recipe for silent memory corruption, so we
+        did the boring careful thing: <span class="mono">dlopen</span> the bundle's
+        <span class="mono">libllama.so</span> with <span class="mono">RTLD_DEEPBIND</span>, resolve
+        every call through a dlsym'd function table, and static-assert the ABI structs
+        (72/160/56 bytes) against the bundle's own headers. The two llama.cpps never see each
+        other's symbols.</p>
+        <p>The result is a <b>token-level</b> HRX backend: <span class="mono">generate()</span>
+        decodes one token at a time on the HRX device (gfx1151), all layers offloaded, KV cache in
+        llama.cpp structures. No HTTP round trip, no subprocess — the binary we used to spawn is
+        now just a library we call.</p>
 
-        <h2>What the NPU measured</h2>
-        <p>End-to-end measurement on the NPU disproved it. On this hardware DSpark measured <span class="mono">0.1 to 0.2 tok/s</span> at <b>0% draft acceptance</b>. Not a fraction of the projection, three orders of magnitude in the other direction. Every drafted token was rejected, so the model recomputed the distribution it had just computed, and the engine paid the full cost for nothing.</p>
-        <table>
-          <thead><tr><th>Metric</th><th>Projected</th><th>Measured end-to-end</th></tr></thead>
-          <tbody>
-            <tr><td>Throughput</td><td>572 tok/s</td><td>0.1 to 0.2 tok/s</td></tr>
-            <tr><td>Draft acceptance</td><td>unstated</td><td>0%</td></tr>
-          </tbody>
-        </table>
+        <h2>It works — and it's fast</h2>
+        <p>End to end through <span class="mono">1bit unified</span> on
+        Qwen3-30B-A3B Q4_K_M (an 18.6 GB MoE GGUF): "What is the capital of France?" →
+        <b>"Paris"</b>, <span class="mono">backend: hrx_gpu</span>. Warm decode <b>~80–87 tok/s</b>
+        in-process, vs <b>38 tok/s</b> for the same bundle spawned fresh as a subprocess, and
+        <b>~70 tok/s</b> for our HIP backend — the in-process path removes the server round trip
+        and the fresh-start JIT cost, and HRX's fused kernels genuinely run warm decode at ~2× HIP
+        for graphs they can fuse.</p>
 
-        <h2>Why it fell apart</h2>
-        <p>Speculative decoding only pays when the draft is cheaper than the target and right more often than wrong. Here the draft cost the same dispatch round trips as the target and agreed with it 0% of the time, so the engine did the full computation and then threw it away. On an NPU where launch and wait dominates every dispatch, a rejected token pays the round trip twice.</p>
-        <p>The projection assumed the mechanism, not the silicon. The silicon was not consulted.</p>
+        <h2>The ceiling, measured honestly</h2>
+        <p>Then we found the wall, and measured it across six model families. HRX's fused node set
+        does not include <span class="mono">GET_ROWS</span> — the token-embedding row-gather that
+        starts every decode — for most quantization types. Q4_K embeddings fuse. q5_0, q8_0,
+        Q4_K_S and IQ2XXS fail closed with <span class="mono">llama_decode: ret = -3</span>.</p>
+        <p>We tried everything local: <span class="mono">n_gpu_layers</span> tuning, pinning the
+        embedding into a CPU buffer via buffer-type overrides. Both are dead ends in this fork —
+        the scheduler keeps one graph split on HRX and no local knob forces the row-gather onto
+        the CPU backend. The subprocess has the identical limitation, so being in-process costs us
+        nothing. <b>This is an upstream problem</b> — llama.cpp PR #27218, still a draft — not
+        ours to fix locally.</p>
+        <div class="callout"><p>The honest reframe: HRX is an <b>acceleration lane</b>, not the
+        engine. Our multi-lane router (HIP, Vulkan, FLM NPU, dedicated engines) with route-order
+        failover means a model HRX can't fuse fails over to ggml_vulkan and completes anyway —
+        verified end to end. The engine is complete with or without HRX.</p></div>
 
-        <h2>What it would take to fix</h2>
-        <p>A working DSpark needs two things measured before anything is published: a draft model that is measurably cheaper end to end than the target, and a live acceptance counter that is printed with every benchmark run. When draft acceptance is a number in the output rather than an assumption in a spreadsheet, the discipline does the rest. Until then, the projection stays a projection.</p>
+        <h2>Zero-copy is a separate, proven story</h2>
+        <p>To keep the two halves of the vision straight: zero-DMA-copy on the NPU side is
+        <b>not</b> part of the HRX lane. It's the SharedBO substrate, re-proven on this box the
+        same week: a Vulkan compute shader reads the NPU's KV cache straight out of NPU-owned
+        pages via dma-buf import and matches the CPU reference (rel err 2e-4). One page set, three
+        views, no memcpy.</p>
 
-        <h2>The record</h2>
-        <div class="callout">
-          <p>The DSpark figures here are historical and unsourced. The projected <span class="mono">572 tok/s</span> and the measured <span class="mono">0.1 to 0.2 tok/s</span> at 0% draft acceptance were recorded before we had a reproducible harness, and both are quarantined in <span class="mono">benchmarks/latest.json _unverified</span>. They are kept because they are the honest record of a projection meeting hardware, not because they are trustworthy evidence.</p>
-        </div>
-        <p>The point of posting a disproven number is the same as posting a real one: the record matters more than the win. A claim that was tested and failed is worth more than a claim that was never tested at all.</p>
+        <h2>Lemonade, too</h2>
+        <p>All 43 chat-capable lemonade models now carry <span class="mono">-HRX</span> registry
+        variants. The ones with K-quant embeddings serve directly on HRX; the rest point at the
+        Vulkan variant — and because lemond has no failover, we documented exactly which is which,
+        so nobody gets a silent 500 on a model HRX can't fuse.</p>
 
+        <h2>Run it</h2>
+        <p><span class="mono">HRX_INPROCESS=1 build/1bit unified -m "Qwen3 30B A3B Instruct"</span>
+        — the bundle loads in-process, weights go to HRX0, warm decode runs at ~2× HIP. For models
+        outside the fused set, the router does exactly what it was built to do: fail over and
+        finish the answer.</p>
       </div>
     
     <section class="related">
       <h2>Related</h2>
+      <a href="https://1bit.monster/1bit-blog.html">1bit.MONSTER: Blog</a>
       <a href="https://1bit.monster/1bit-post-npu-reversal.html">I reverse-engineered AMD's NPU stack in 4 days</a>
-      <a href="https://1bit.monster/1bit-post-three-bugs.html">Three bugs that broke 97 tok/s</a>
-      <a href="https://1bit.monster/1bit-post-halo-reviews.html">What the Ryzen AI Halo reviews didn't tell you</a>
+      <a href="https://1bit.monster/1bit-post-lemonade-v1180.html">Lemonade v11.8.0: the 15-backend SDK lands ds4 for Strix Halo</a>
     </section>
   </article>
   </main>
@@ -403,7 +438,7 @@
     <div class="container row-between" style="max-width: 1000px;">
       <span>© 2026 1bit.MONSTER · MIT License</span>
       <a class="meta" href="https://discord.gg/Qy38d4Xu2h" target="_blank" rel="noopener">Join Discord &#8599;</a>
-
+      <a class="meta" href="https://fluxer.gg/7wqCREKi" target="_blank" rel="noopener">Community support &#8599;</a>
       <a class="meta" href="https://github.com/1bit-MONSTER/1bit-MONSTER">github.com/1bit-MONSTER</a>
     </div>
     <div class="container">
@@ -412,6 +447,8 @@
     </div>
   </footer>
 <script src="analytics.js"></script>
+
+  <script src="analytics.js"></script>
 <script src="https://context7.com/widget.js" data-library="/1bit-monster/1bit-monster"></script>
 </body>
 </html>
