@@ -9,6 +9,10 @@
 #include <unistd.h>
 #include <errno.h>
 #include <math.h>
+#ifndef MIN64
+#define MIN64(a,b) ((a)<(b)?(a):(b))
+#endif
+#include <math.h>
 
 // ========= BF16 conversion helpers =========
 float bf16_to_float(uint16_t v) {
@@ -48,72 +52,198 @@ uint16_t float_to_bf16(float v) {
 //   - Padded within a 1MB BO (second half zero padding)
 
 // ========= Q4NX format =========
-// Q4NX stores weights in a hybrid I8/BF16 format.
-// Each 2 consecutive I8 bytes form one BF16 value: [lo_byte, hi_byte] little-endian.
-// The shape [rows, cols] in the metadata refers to I8 ELEMENTS (1 byte each).
-// Actual BF16 elements = rows * cols / 2.
+// Q4NX "I8" tensors are NOT raw BF16 bytes. Each 5120-byte I8 row is ONE
+// torch2aie tile of [32 BF16 rows x 256 BF16 cols]:
+//   [0..511]    256 bf16 scales  (scales[lr*8+g], g = col/32, lr = tile row)
+//   [512..1023] 256 bf16 zero points (asymmetric for Qwen3: W = q*scale + zp)
+//   [1024..5119] packed int4: lane = lr/16, byte = lane*2048 + cc*8 + (lr%16)/2
+//                low nibble = even tile row, UNSIGNED (q in [0,15])
+// The tensor is a tile grid: n_tile_cols = in_features/256, n_tile_rows =
+// i8_rows/n_tile_cols; logical rows = n_tile_rows*32, cols = n_tile_cols*256.
+// The dequant must expand these tiles; reading pairs as BF16 (the old code)
+// misinterprets scale/nibble bytes as weights and is numerically invalid.
 // NPU blocking: each BO holds [npu_block_rows, npu_block_cols] BF16 values = 512KB data + 512KB zeros.
 // Number of column blocks = ceil(cols / 2 / block_cols).
 
-int npu_weight_num_blocks(const TensorDesc* desc, const ModelConfig* config) {
-    if (desc->ndim != 2) return 0;
-    int64_t i8_cols = desc->shape[1];
-    int64_t bf16_cols = i8_cols / 2;  // 2 I8 bytes per BF16
-    return (int)((bf16_cols + config->npu_block_cols - 1) / config->npu_block_cols);
+int npu_weight_num_blocks(const TensorDesc* desc, const ModelConfig* config,
+                          int in_features) {
+    if (desc->ndim != 2 || in_features <= 0) return 0;
+    // Each I8 row is a 32x256 tile; the I8 row count spans the whole tile
+    // grid, so logical_rows = i8_rows * 8192 / in_features.
+    int64_t i8_rows = desc->shape[0];
+    int64_t logical_rows = i8_rows * 8192 / in_features;
+    int n_rb = (int)((logical_rows + config->npu_block_rows - 1) / config->npu_block_rows);
+    int n_cb = (int)((in_features + config->npu_block_cols - 1) / config->npu_block_cols);
+    return n_rb * n_cb;
+}
+
+// Read a bf16 at byte offset off of a tile row (explicit bytes: the q4nx
+// tensor can start at an odd file offset, so a (uint16_t*) cast is UB).
+static inline uint16_t q4nx_bf16(const uint8_t* p) {
+    return (uint16_t)(p[0]) | ((uint16_t)(p[1]) << 8);
+}
+
+static inline uint16_t f32_to_bf16(float v) {
+    uint32_t b; memcpy(&b, &v, 4);
+    uint32_t r = ((b >> 16) & 1) + 0x7FFF;
+    return (uint16_t)((b + r) >> 16);
 }
 
 int npu_dequant_block(void* out, const void* in,
                        const TensorDesc* desc, const ModelConfig* config,
-                       int block_idx) {
-    int64_t rows = desc->shape[0];
-    int64_t i8_cols = desc->shape[1];
-    int64_t bf16_cols = i8_cols / 2;  // Elements per row in BF16
-    int block_cols = config->npu_block_cols;  // 1024
-    
+                       int block_idx, int in_features) {
+    const int TILE_ROWS = 32, TILE_COLS = 256, TILE_BYTES = 5120;
+    const int block_rows = config->npu_block_rows;   // 256
+    const int block_cols = config->npu_block_cols;   // 1024
+    int64_t i8_rows = desc->shape[0];
+    int n_tile_cols = in_features / TILE_COLS;
+    if (n_tile_cols <= 0) return 0;
+    int64_t logical_rows = i8_rows * 8192 / in_features;
+    int n_row_blocks = (int)((logical_rows + block_rows - 1) / block_rows);
+    int n_col_blocks = (int)((in_features + block_cols - 1) / block_cols);
+    int rb = block_idx / n_col_blocks;      // row block
+    int cb = block_idx % n_col_blocks;      // col block
+    if (rb >= n_row_blocks || cb >= n_col_blocks) return 0;
+    int64_t row_start = (int64_t)rb * block_rows;
+    int col_start = cb * block_cols;
+    int num_rows = (int)MIN64(logical_rows - row_start, block_rows);
+    int num_cols = (int)MIN64(in_features - col_start, block_cols);
+    if (num_rows <= 0 || num_cols <= 0) return 0;
+
     const uint8_t* data = (const uint8_t*)in;
     uint16_t* bf16_out = (uint16_t*)out;
-    
-    int col_start = block_idx * block_cols;
-    int col_end = col_start + block_cols;
-    if (col_end > bf16_cols) col_end = (int)bf16_cols;
-    int num_cols = col_end - col_start;
-    int num_rows = (int)rows;
-    if (num_rows > (int)config->npu_block_rows) 
-        num_rows = (int)config->npu_block_rows;
-    
-    // Zero entire output block
     memset(bf16_out, 0, (size_t)num_rows * block_cols * 2);
-    
-    // For each BF16 value, read 2 consecutive I8 bytes as little-endian BF16
-    // I8 data layout: [lo_byte_0, hi_byte_0, lo_byte_1, hi_byte_1, ...] per row
+
     for (int r = 0; r < num_rows; r++) {
+        int64_t lr_global = row_start + r;
+        int tile_row = (int)(lr_global / TILE_ROWS);
+        int lr = (int)(lr_global % TILE_ROWS);
+        const uint8_t* row0 = data + (size_t)(tile_row * n_tile_cols) * TILE_BYTES;
+        int lane = lr / 16;
+        int byte_idx = (lr % 16) / 2;
+        int nib = lr % 2;
         for (int c = 0; c < num_cols; c++) {
-            // Position in BF16 space
-            int bf16_idx = r * bf16_cols + col_start + c;
-            // Position in I8 byte space (2 bytes per BF16)
-            int i8_byte_idx = bf16_idx * 2;
-            if (i8_byte_idx + 1 >= rows * i8_cols) break;
-            
-            // Read as little-endian uint16 = BF16
-            uint16_t bf16_val;
-            memcpy(&bf16_val, &data[i8_byte_idx], 2);
-            bf16_out[r * block_cols + c] = bf16_val;
+            int cc_global = col_start + c;
+            int tile_col = cc_global / TILE_COLS;
+            int cc = cc_global % TILE_COLS;
+            int g = cc / 32;
+            const uint8_t* row = row0 + (size_t)tile_col * TILE_BYTES;
+            const uint8_t* packed = row + 1024 + (size_t)lane * (TILE_COLS * 8);
+            // Qwen3 (unsigned) scale layout is GROUP-major: scales[g*32+lr]
+            // (the Zaya signed converter is row-major scales[lr*8+g] instead —
+            // verified empirically: g*32+lr dequantizes Qwen3 weights to the
+            // plausible [-0.57, 0.64] range, lr*8+g to garbage ±1e3).
+            int sc_off = (g * 32 + lr) * 2;
+            float scale = bf16_to_float(q4nx_bf16(row + sc_off));
+            float zp    = bf16_to_float(q4nx_bf16(row + 512 + sc_off));
+            if (!isfinite(scale) || fabs(scale) > 100.0f) scale = 0.0f;
+            if (!isfinite(zp) || fabs(zp) > 100.0f) zp = 0.0f;
+            uint8_t b = packed[cc * 8 + byte_idx];
+            int q = nib == 0 ? (b & 0x0F) : ((b >> 4) & 0x0F);
+            // FastFlowLM Qwen3 q4nx formula — verified BIT-EXACT (maxdiff 0.0)
+            // against the runtime's own q4nx_dequantize (libq4_npu_eXpress.so):
+            //   W = (q - zp) * scale
+            // with scales/zero-points bf16 at the GROUP-major index g*32+lr
+            // (the torch2aie/zaya convention W = q*scale + zp does NOT match
+            // this file — it mis-dequantizes every element).
+            float w = ((float)q - zp) * scale;
+            bf16_out[r * block_cols + c] = f32_to_bf16(w);
         }
     }
-    
     return num_rows * num_cols;
 }
 
 int npu_pack_weight_bo(uint8_t* bo_buffer, const void* in,
                         const TensorDesc* desc, const ModelConfig* config,
-                        int block_idx) {
+                        int block_idx, int in_features) {
     int bo_size = config->npu_weight_bo_size;
     memset(bo_buffer, 0, bo_size);
     
-    int num_written = npu_dequant_block(bo_buffer, in, desc, config, block_idx);
+    int num_written = npu_dequant_block(bo_buffer, in, desc, config, block_idx, in_features);
     if (num_written < 0) return num_written;
     
     return 0;
+}
+
+
+// ===========================================================================
+// Runtime-layout weight packer (issues #2006/#2015) — decoded byte-exact from
+// the real FastFlowLM runtime's captured weight BOs (2026-09-01):
+//
+// Per-layer weight BO (10 MB = 1920 x 5120-B Q4NX tiles, layers in model
+// order):
+//   [0, 256)   q_proj tiles      G=8    (reorder group)
+//   [256, 384) k_proj tiles      G=8
+//   [384, 512) v_proj tiles      G=8
+//   [512, 768) o_proj tiles      G=16
+//   [768,1536) up/gate ALTERNATING 64-tile chunks: up0, gate0, up1, gate1...
+//               each chunk reordered with G=8
+//   [1536,1920) down_proj tiles  G=24
+// Tile reorder within a group G (out[o] = in[G*(o/G) + (o/2)%(G/2) + (G/2)*(o%2)]):
+//   G=8:  [0,4,1,5,2,6,3,7]  (q/k/v/gate/up)
+//   G=16: [0,8,1,9,...,7,15] (o_proj)
+//   G=24: stride 12           (down_proj)
+// The mm/layer kernels DEQUANTIZE IN-KERNEL from these raw 5120-B tiles —
+// the host never dequantizes (the old npu_dequant_block path is NOT the
+// runtime layout).
+// ===========================================================================
+#define NPU_TILE_BYTES 5120
+#define NPU_LAYER_TILES 1920       // q256+k128+v128+o256+up384+gate384+down384
+#define NPU_LAYER_BO_BYTES (NPU_LAYER_TILES * NPU_TILE_BYTES)  // 9830400
+
+static void npu_reorder_tiles(uint8_t* dst, const uint8_t* src, int n_tiles, int G) {
+    const int S = G / 2;
+    for (int o = 0; o < n_tiles; o++) {
+        int i = G * (o / G) + (o / 2) % S + S * (o % 2);
+        memcpy(dst + (size_t)o * NPU_TILE_BYTES,
+               src + (size_t)i * NPU_TILE_BYTES, NPU_TILE_BYTES);
+    }
+}
+
+// Pack one projection's reordered tiles into the layer BO at `tile_offset`.
+static void npu_pack_proj(uint8_t* bo, const TensorDesc* desc, ModelWeights* mw,
+                          int tile_offset, int G) {
+    if (desc->ndim != 2) return;
+    int n_tiles = (int)desc->shape[0];
+    const uint8_t* data = (const uint8_t*)model_tensor_data(mw, (TensorDesc*)desc);
+    npu_reorder_tiles(bo + (size_t)tile_offset * NPU_TILE_BYTES, data, n_tiles, G);
+}
+
+// Pack a full layer (all 7 projections) into the runtime's 10 MB layout.
+// Returns the number of tiles written (1920) or 0 on error.
+int npu_pack_layer_bo(uint8_t* bo_buffer, ModelWeights* mw,
+                      const ModelConfig* config, int layer_idx) {
+    if (!bo_buffer || !mw || !config || layer_idx < 0 || layer_idx >= config->num_layers)
+        return 0;
+    memset(bo_buffer, 0, NPU_LAYER_BO_BYTES);
+    LayerWeights* lw = &mw->layers[layer_idx];
+
+    npu_pack_proj(bo_buffer, &lw->q_proj_weight, mw, 0, 8);
+    npu_pack_proj(bo_buffer, &lw->k_proj_weight, mw, 256, 8);
+    npu_pack_proj(bo_buffer, &lw->v_proj_weight, mw, 384, 8);
+    npu_pack_proj(bo_buffer, &lw->o_proj_weight, mw, 512, 16);
+
+    // gate/up: alternating 64-tile chunks (up0, gate0, up1, gate1, ...)
+    const int CH = 64;  // chunk size
+    int up_tiles = (lw->up_proj_weight.ndim == 2) ? (int)lw->up_proj_weight.shape[0] : 0;
+    int gate_tiles = (lw->gate_proj_weight.ndim == 2) ? (int)lw->gate_proj_weight.shape[0] : 0;
+    const uint8_t* up = (const uint8_t*)model_tensor_data(mw, &lw->up_proj_weight);
+    const uint8_t* gate = (const uint8_t*)model_tensor_data(mw, &lw->gate_proj_weight);
+    int n_chunks = (up_tiles + CH - 1) / CH;
+    for (int c = 0; c < n_chunks; c++) {
+        int up_n = (up_tiles - c * CH > CH) ? CH : up_tiles - c * CH;
+        int gate_n = (gate_tiles - c * CH > CH) ? CH : gate_tiles - c * CH;
+        int base = 768 + c * 2 * CH;
+        if (up_n > 0 && up)
+            npu_reorder_tiles(bo_buffer + (size_t)(base) * NPU_TILE_BYTES,
+                              up + (size_t)c * CH * NPU_TILE_BYTES, up_n, 8);
+        if (gate_n > 0 && gate)
+            npu_reorder_tiles(bo_buffer + (size_t)(base + CH) * NPU_TILE_BYTES,
+                              gate + (size_t)c * CH * NPU_TILE_BYTES, gate_n, 8);
+    }
+
+    npu_pack_proj(bo_buffer, &lw->down_proj_weight, mw, 1536, 24);
+    return NPU_LAYER_TILES;
 }
 
 // ========= Simple JSON Parser =========
@@ -152,6 +282,7 @@ ModelWeights* model_load(const char* path, ModelConfig config) {
     
     uint64_t header_size;
     memcpy(&header_size, mw->file_data, 8);
+    mw->data_base = 8 + header_size;
     
     LOG_INFO("Model file: %s (%lu MB)", path, (unsigned long)(mw->file_size / 1024 / 1024));
     LOG_INFO("Header: %lu bytes JSON", (unsigned long)header_size);
@@ -256,7 +387,10 @@ void model_free(ModelWeights* mw) {
 
 void* model_tensor_data(ModelWeights* mw, TensorDesc* desc) {
     if (!mw || !desc) return NULL;
-    return mw->file_data + desc->data_offset;
+    // data_offsets in the JSON metadata are relative to the tensor-data start
+    // (right after the 8-byte length + JSON header). Without data_base every
+    // tensor is read header_len bytes early (garbage scales/nibbles).
+    return mw->file_data + mw->data_base + desc->data_offset;
 }
 
 int model_find_tensor(const char* name, ModelWeights* mw) {

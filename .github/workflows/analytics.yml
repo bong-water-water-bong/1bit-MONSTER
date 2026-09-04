@@ -60,27 +60,60 @@ jobs:
             exit 0
           fi
           echo "Site token: ${SITE_TOKEN:0:8}… (read from site/analytics.js)"
+          # NOTE: the dashboard embed token (SITE_TOKEN, read from analytics.js)
+          # does NOT reliably map to the dataset that actually receives beacon
+          # events — it drifted 2026-08-31 (re-created the Web Analytics site)
+          # and again 2026-09-01 (the live beacon still lands in dataset
+          # 87349337… while 4a2e28e9… stays empty). The active siteTag is
+          # therefore resolved from the live data below (hardcoded fallback).
 
           TODAY=$(date -u +%Y-%m-%d)
           FROM=$(date -u -d "7 days ago" +%Y-%m-%d)
           echo "Window: $FROM .. $TODAY"
 
+          # Resolve the ACTIVE RUM dataset: the siteTag whose dataset has the
+          # most visits in the window (authoritative — the embed-token mapping
+          # has drifted twice). Falls back to the hardcoded tag if empty.
+          RESOLVE_JSON=$(gql "{ viewer { accounts(filter: {accountTag: \"$ACCOUNT_ID\"}) { rumPageloadEventsAdaptiveGroups(limit: 1, filter: {date_geq: \"$FROM\", date_leq: \"$TODAY\"}, orderBy: [sum_visits_DESC]) { dimensions { siteTag } sum { visits } } } } }")
+          SITE_TAG=$(echo "$RESOLVE_JSON" | jq -r '.data.viewer.accounts[0].rumPageloadEventsAdaptiveGroups[0].dimensions.siteTag // empty')
+          [ -n "$SITE_TAG" ] || SITE_TAG="${SITE_TAG:-4a2e28e96a7446c6a9933a0f816efc24}"
+          echo "Query tag: ${SITE_TAG:0:8}… (resolved from live RUM data; fallback 4a2e28e9…)"
+
           echo ""
           echo "--- Totals ---"
-          TOTAL_JSON=$(gql "{ viewer { accounts(filter: {accountTag: \"$ACCOUNT_ID\"}) { rumPageloadEventsAdaptiveGroups(limit: 1, filter: {siteTag: \"$SITE_TOKEN\", date_geq: \"$FROM\", date_leq: \"$TODAY\"}) { sum { visits } } } } }")
+          TOTAL_JSON=$(gql "{ viewer { accounts(filter: {accountTag: \"$ACCOUNT_ID\"}) { rumPageloadEventsAdaptiveGroups(limit: 1, filter: {siteTag: \"$SITE_TAG\", date_geq: \"$FROM\", date_leq: \"$TODAY\"}) { sum { visits } } } } }")
           TOTAL_VISITS=$(echo "$TOTAL_JSON" | jq -r '.data.viewer.accounts[0].rumPageloadEventsAdaptiveGroups[0].sum.visits // 0')
           echo "Total visits: $TOTAL_VISITS (window $FROM .. $TODAY)"
           echo "$TOTAL_JSON" | jq -r 'if .errors then "query errors: \(.errors[0].message)" else empty end'
 
           echo ""
           echo "--- Top pages ---"
-          gql "{ viewer { accounts(filter: {accountTag: \"$ACCOUNT_ID\"}) { rumPageloadEventsAdaptiveGroups(limit: 10, filter: {siteTag: \"$SITE_TOKEN\", date_geq: \"$FROM\", date_leq: \"$TODAY\"}, orderBy: [sum_visits_DESC]) { dimensions { requestPath } sum { visits } } } } }" | \
+          gql "{ viewer { accounts(filter: {accountTag: \"$ACCOUNT_ID\"}) { rumPageloadEventsAdaptiveGroups(limit: 10, filter: {siteTag: \"$SITE_TAG\", date_geq: \"$FROM\", date_leq: \"$TODAY\"}, orderBy: [sum_visits_DESC]) { dimensions { requestPath } sum { visits } } } } }" | \
             jq -r 'if .data then ([.data.viewer.accounts[0].rumPageloadEventsAdaptiveGroups[] | { path: .dimensions.requestPath, views: .sum.visits }] | sort_by(-.views) | .[:10][] | "\(.views)\t\(.path)") else "RUM query failed: \(.errors[0].message // "unknown")" end'
 
           echo ""
           echo "--- Top referrers (how people got here) ---"
-          gql "{ viewer { accounts(filter: {accountTag: \"$ACCOUNT_ID\"}) { rumPageloadEventsAdaptiveGroups(limit: 10, filter: {siteTag: \"$SITE_TOKEN\", date_geq: \"$FROM\", date_leq: \"$TODAY\"}, orderBy: [sum_visits_DESC]) { dimensions { refererHost } sum { visits } } } } }" | \
+          gql "{ viewer { accounts(filter: {accountTag: \"$ACCOUNT_ID\"}) { rumPageloadEventsAdaptiveGroups(limit: 10, filter: {siteTag: \"$SITE_TAG\", date_geq: \"$FROM\", date_leq: \"$TODAY\"}, orderBy: [sum_visits_DESC]) { dimensions { refererHost } sum { visits } } } } }" | \
             jq -r 'if .data then ([.data.viewer.accounts[0].rumPageloadEventsAdaptiveGroups[] | { referer: .dimensions.refererHost, views: .sum.visits }] | sort_by(-.views) | .[:10][] | "\(.views)\t\(.referer)") else "RUM query failed: \(.errors[0].message // "unknown")" end'
+
+          echo ""
+          echo "--- RUM health check (token drift detection) ---"
+          # If the beacon token reports no data but the account has RUM data, the
+          # site tag in analytics.yml has drifted from the real RUM site. Discover
+          # the actual siteTag(s) so the report keeps working (2026-08-31: embed
+          # token 33fb8448… maps to dataset tag 4a2e28e9…; the old site 87349337…
+          # still holds legacy data).
+          if [ "${TOTAL_VISITS:-0}" -eq 0 ] 2>/dev/null; then
+            echo "⚠ Site token ${SITE_TOKEN:0:8}… has NO data in this window — checking for token drift:"
+            gql "{ viewer { accounts(filter: {accountTag: \"$ACCOUNT_ID\"}) { rumPageloadEventsAdaptiveGroups(limit: 10, filter: {date_geq: \"$FROM\", date_leq: \"$TODAY\"}, orderBy: [sum_visits_DESC]) { dimensions { siteTag requestPath } sum { visits } } } } }" | \
+              jq -r 'if .data then
+                       ([.data.viewer.accounts[0].rumPageloadEventsAdaptiveGroups[] |
+                         { tag: .dimensions.siteTag, path: .dimensions.requestPath, views: .sum.visits }]
+                        | .[] | "\(.tag)\t\(.views)\t\(.path)")
+                     else "health query failed: \(.errors[0].message // "unknown")" end'
+          else
+            echo "Site token has data — no drift detected."
+          fi
 
           echo ""
           echo "--- Attribution: who shared what (share.html links) ---"
@@ -88,7 +121,7 @@ jobs:
           # because Cloudflare Web Analytics does not log query strings (documented
           # limitation). 404.html fires the RUM beacon on the /s/ URL, so requestPath
           # records the full attribution before redirecting to the target.
-          ATTRIBUTION_JSON=$(gql "{ viewer { accounts(filter: {accountTag: \"$ACCOUNT_ID\"}) { rumPageloadEventsAdaptiveGroups(limit: 50, filter: {siteTag: \"$SITE_TOKEN\", date_geq: \"$FROM\", date_leq: \"$TODAY\"}, orderBy: [sum_visits_DESC]) { dimensions { requestPath } sum { visits } } } } }")
+          ATTRIBUTION_JSON=$(gql "{ viewer { accounts(filter: {accountTag: \"$ACCOUNT_ID\"}) { rumPageloadEventsAdaptiveGroups(limit: 50, filter: {siteTag: \"$SITE_TAG\", date_geq: \"$FROM\", date_leq: \"$TODAY\"}, orderBy: [sum_visits_DESC]) { dimensions { requestPath } sum { visits } } } } }")
           ATTRIBUTED=$(echo "$ATTRIBUTION_JSON" | jq -r '
             if .data then
               ([.data.viewer.accounts[0].rumPageloadEventsAdaptiveGroups[]
@@ -119,6 +152,42 @@ jobs:
                  | sort_by(-.views) | .[:25][])
                 | "\(.views)\t\(.sharer)\t\(.team)\t\(.medium)"
               else empty end'
+          fi
+
+          echo ""
+          echo "=== Zone analytics (1bit.monster — real edge traffic, independent of RUM) ==="
+          ZONE_ID=$(curl -s -H "Authorization: Bearer $RUM_TOKEN" "https://api.cloudflare.com/client/v4/zones?name=1bit.monster" | jq -r '.result[0].id // empty')
+          if [ -n "$ZONE_ID" ]; then
+            echo "Zone: 1bit.monster ($ZONE_ID)"
+            gql "{ viewer { zones(filter: {zoneTag: \"$ZONE_ID\"}) { httpRequests1dGroups(limit: 10, filter: {date_geq: \"$FROM\", date_leq: \"$TODAY\"}, orderBy: [date_ASC]) { dimensions { date } sum { requests pageViews } } } } }" | \
+              jq -r 'if .data then
+                       ([.data.viewer.zones[0].httpRequests1dGroups[] |
+                         { date: .dimensions.date, requests: .sum.requests, pageViews: .sum.pageViews }]
+                        | .[] | "\(.date)\t\(.requests) req\t\(.pageViews) pv")
+                     else "zone analytics query failed: \(.errors[0].message // "unknown")" end'
+
+            echo ""
+            echo "=== Visitors by country (top 10, 7d) ==="
+            # httpRequestsAdaptiveGroups supports clientCountryName but only
+            # 1-day windows (a 7d range errors out); loop the last 7 days and
+            # aggregate by country (codes are ISO alpha-2).
+            COUNTRIES=$(for d in $(seq 0 6); do
+              DAY=$(date -u -d "$FROM + $d days" +%Y-%m-%d)
+              if RESP=$(gql "{ viewer { zones(filter: {zoneTag: \"$ZONE_ID\"}) { httpRequestsAdaptiveGroups(limit: 100, filter: {date: \"$DAY\"}, orderBy: [count_DESC]) { dimensions { clientCountryName } count } } } }"); then
+                ERR=$(printf '%s' "$RESP" | jq -r '.errors[0].message // empty')
+                [ -z "$ERR" ] || echo "country query failed (day $DAY): $ERR" >&2
+                printf '%s' "$RESP" | jq -r 'if .data then [.data.viewer.zones[0].httpRequestsAdaptiveGroups[]? | select(.dimensions.clientCountryName != null) | { country: .dimensions.clientCountryName, requests: .count }] | .[] | "\(.country)	\(.requests)" else empty end'
+              else
+                echo "country query failed (day $DAY): HTTP error" >&2
+              fi
+            done | awk -F"\t" '/\t/ {agg[$1]+=$2} END {for (c in agg) print c "\t" agg[c]}' | sort -t"$(printf '\t')" -k2 -rn | head -10 | awk -F"\t" '{print $1 "\t" $2 " req"}')
+            if [ -n "$COUNTRIES" ]; then
+              echo "$COUNTRIES"
+            else
+              echo "country query failed: no country data in window"
+            fi
+          else
+            echo "Zone 1bit.monster not visible to the analytics token (need Zone: Read on the WA token)."
           fi
 
           echo ""

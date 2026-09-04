@@ -157,7 +157,7 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
 
-set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_STANDARD 26)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_HIP_STANDARD 17)
@@ -214,8 +214,62 @@ endfunction()
 
 _find_therock_sdk_base(THEROCK_SDK_BASE)
 
+# A system hip-runtime-amd package (e.g. /usr/include/hip) shadows TheRock's
+# HIP headers: amdclang++ auto-adds the SDK include dir with -idirafter, which
+# loses to /usr/include, so <hip/...> and <rocwmma/...> resolve to headers
+# whose __ocml_* builtins this clang does not declare. Put TheRock's include
+# dir ahead of system dirs so device math builtins match amdclang++.
+if(THEROCK_SDK_BASE AND EXISTS "${THEROCK_SDK_BASE}/include/hip/hip_runtime.h")
+    set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} -isystem ${THEROCK_SDK_BASE}/include")
+    message(STATUS "rocm-cpp: TheRock HIP headers take precedence (${THEROCK_SDK_BASE}/include)")
+endif()
+
 set(ROCM_ROOT "${_RC_ROCM_DEFAULT}" CACHE PATH "ROCm install root")
 list(PREPEND CMAKE_PREFIX_PATH "${ROCM_ROOT}" "${ROCM_ROOT}/lib/cmake")
+
+# TheRock pip/venv SDKs keep headers under
+# lib/python*/site-packages/_rocm_sdk_devel/include and leave the
+# top-level ${ROCM_ROOT}/include empty. Falling through to the system
+# ROCm headers (e.g. Ubuntu /usr/include/hip, 7.1) breaks amdclang++
+# builds: amd_hip_bf16.h references __ocml_* builtins that TheRock's
+# clang does not declare (smoke-test failure, 2026-08-28). Resolve the
+# include root that actually contains hip/; guarded so classic ROCm
+# installs keep ${ROCM_ROOT}/include unchanged.
+set(ROCM_INCLUDE_DIR "${ROCM_ROOT}/include")
+if(THEROCK_SDK_BASE AND NOT EXISTS "${ROCM_INCLUDE_DIR}/hip")
+    set(ROCM_INCLUDE_DIR "${THEROCK_SDK_BASE}/include")
+    message(STATUS "rocm-cpp: ROCm include root = ${ROCM_INCLUDE_DIR} (TheRock SDK layout)")
+endif()
+
+# HIP-language objects (amdclang++ -x hip) do not inherit SYSTEM include
+# dirs from target_include_directories / hip::host usage requirements
+# (observed with CMake 4.2's HIP rules — .hip objects compile without any
+# -isystem, fall back to the system ROCm 7.1 headers under /usr/include and
+# fail on __ocml_* builtins). Apply the resolved ROCm include to every HIP
+# compile via CMAKE_HIP_FLAGS. Guarded so repeated evaluation in one
+# configure does not duplicate the flag; on classic ROCm installs
+# ROCM_INCLUDE_DIR == ${ROCM_ROOT}/include, i.e. the same include the
+# explicit SYSTEM include lines already provided.
+if(ROCM_INCLUDE_DIR AND NOT CMAKE_HIP_FLAGS MATCHES "isystem${ROCM_INCLUDE_DIR}")
+    # Plain (normal) variable: the HIP rules expand CMAKE_HIP_FLAGS at
+    # generate time from the project-scope variable, not from the cache
+    # (a CACHE FORCE set would be shadowed by the variable project()
+    # created when the HIP language was enabled).
+    set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} -isystem${ROCM_INCLUDE_DIR}")
+    message(STATUS "rocm-cpp: HIP flags += -isystem${ROCM_INCLUDE_DIR}")
+endif()
+
+# TheRock pip/venv SDKs ship their own hip-config under
+# <sdk>/lib/cmake/hip; without pinning hip_DIR the CONFIG search below
+# resolves the SYSTEM hip package first (/usr/...), whose HIP_INCLUDE_DIRS
+# point at the Ubuntu ROCm 7.1 headers (/usr/include/hip) — those reference
+# __ocml_* builtins that TheRock's clang does not declare, breaking every
+# bf16/fp8 kernel (smoke-test failure, 2026-08-28). Pin to TheRock's config
+# when present; classic ROCm installs (no SDK config) keep default detection.
+if(THEROCK_SDK_BASE AND EXISTS "${THEROCK_SDK_BASE}/lib/cmake/hip/hip-config.cmake")
+    set(hip_DIR "${THEROCK_SDK_BASE}/lib/cmake/hip" CACHE PATH "HIP config (TheRock SDK)")
+    message(STATUS "rocm-cpp: pinning hip_DIR to TheRock SDK: ${hip_DIR}")
+endif()
 
 find_package(hip REQUIRED CONFIG
     PATHS "${ROCM_ROOT}"
@@ -237,7 +291,9 @@ foreach(_rc_base "${_RC_PIP_PATH}" "${_RC_THEROCK_DIR}" "${_RC_THEROCK_LEGACY}" 
 endforeach()
 
 if(NOT ROCWMMA_FOUND)
-    file(GLOB_RECURSE _RC_ROCWMMA_HPP "$ENV{HOME}/.local/lib/python*/site-packages/_rocm_sdk_devel/include/rocwmma/rocwmma.hpp")
+    file(GLOB_RECURSE _RC_ROCWMMA_HPP
+        "$ENV{HOME}/.local/lib/python*/site-packages/_rocm_sdk_devel/include/rocwmma/rocwmma.hpp"
+        "${_RC_THEROCK_OPT}/lib/python*/site-packages/_rocm_sdk_devel/include/rocwmma/rocwmma.hpp")
     list(LENGTH _RC_ROCWMMA_HPP _RC_ROCWMMA_N)
     if(_RC_ROCWMMA_N GREATER 0)
         list(GET _RC_ROCWMMA_HPP 0 _RC_ROCWMMA_PATH)
@@ -426,22 +482,33 @@ target_include_directories(gguf_reader PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>)
 
-# -- gguf_to_onebp : pure-C++ GGUF -> 1BP converter (Q4NX + TQ2 ternary) -------
+# -- gguf_to_onebp : pure-C++ GGUF -> 1BP converter (F16 lossless default; --q4nx/--tq2/--tq2nz/--tq1) --
 # Replaces the old tools/gguf_to_onebp.py. No Python anywhere in the convert
-# path. `--tq2` emits symmetric 2-bit ternary (half the size of Q4NX).
-add_executable(gguf_to_onebp tools/gguf_to_onebp.cpp)
+# path. Default is lossless F16 (4-bit Q4NX loses ~0.998/layer and compounds
+# into garbage logits on deep models — see issue #1728); `--q4nx`/`--tq2`/
+# `--tq2nz`/`--tq1` opt in to the lossy quant paths.
+add_executable(gguf_to_onebp src/gguf_to_onebp.cpp)
 target_link_libraries(gguf_to_onebp PRIVATE gguf_reader)
-target_compile_options(gguf_to_onebp PRIVATE -O3 -std=c++23)
+target_compile_options(gguf_to_onebp PRIVATE -O3 -std=c++26)
+
+# -- verify_onebp : round-trip gate for gguf_to_onebp output (host-only) ------
+# Dequantizes a converted .1bp back to f32 via the production loader parse
+# (OnebpModel) + the converter's tile math, and compares against the source
+# GGUF. Usage: verify_onebp model.gguf model.1bp  (exit 0 = every tensor
+# round-trips within quantization tolerance; catches truncated/corrupt files).
+add_executable(verify_onebp tests/verify_onebp.cpp)
+target_link_libraries(verify_onebp PRIVATE gguf_reader onebp_model)
+target_compile_options(verify_onebp PRIVATE -O3 -std=c++26)
 
 # -- gguf_to_tilefuse : GGUF -> TileFuse pre-tiled int4 layout (arXiv 2606.11357)
 add_executable(gguf_to_tilefuse tools/gguf_to_tilefuse.cpp)
 target_link_libraries(gguf_to_tilefuse PRIVATE gguf_reader)
-target_compile_options(gguf_to_tilefuse PRIVATE -O3 -std=c++23)
+target_compile_options(gguf_to_tilefuse PRIVATE -O3 -std=c++26)
 
 # -- tf_gemv : reference fused GEMV over the TileFuse layout (M2 kernel logic)
 add_executable(tf_gemv tools/tf_gemv.cpp)
 target_link_libraries(tf_gemv PRIVATE gguf_reader)
-target_compile_options(tf_gemv PRIVATE -O3 -std=c++23)
+target_compile_options(tf_gemv PRIVATE -O3 -std=c++26)
 
 # -- zuna_format : EEG autoencoder lives in onebin as the `zuna` subcommand. -----
 #   tools/zuna_port.cpp (vendored from github.com/1bit-MONSTER/eeg-medical, the
@@ -455,7 +522,7 @@ add_library(vl_image STATIC src/vl_processor.cpp)
 target_include_directories(vl_image PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>)
-target_compile_options(vl_image PRIVATE -O3 -std=c++23 -Wno-unused-result)
+target_compile_options(vl_image PRIVATE -O3 -std=c++26 -Wno-unused-result)
 # vl_processor.cpp uses cpp-httplib as its HTTP client (SSRF-safe downloads,
 # issues #1278/#1291) — header-only, propagated to all consumers.
 target_link_libraries(vl_image PUBLIC httplib::httplib)
@@ -466,14 +533,14 @@ add_library(onebp_model STATIC src/onebp_model.cpp)
 target_include_directories(onebp_model PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>)
-target_compile_options(onebp_model PRIVATE -O3 -std=c++23 -Wno-unused-result)
+target_compile_options(onebp_model PRIVATE -O3 -std=c++26 -Wno-unused-result)
 
 # -- libvision_encoder : ViT encoder + vision-text projector (CPU, no HIP dep) --
 add_library(vision_encoder STATIC src/vision_encoder.cpp)
 target_include_directories(vision_encoder PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>)
-target_compile_options(vision_encoder PRIVATE -O3 -march=native -std=c++23 -Wno-unused-result)
+target_compile_options(vision_encoder PRIVATE -O3 -march=native -std=c++26 -Wno-unused-result)
 target_link_libraries(vision_encoder PUBLIC vl_image backend_manager onebp_model)
 
 # -- libwhisper : Speech-to-text (Whisper) ----------------------------------------------
@@ -484,7 +551,7 @@ add_library(whisper STATIC src/whisper.cpp src/whisper_hip.hip)
 target_include_directories(whisper PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>)
-target_compile_options(whisper PRIVATE -O3 -march=native -std=c++23 -Wno-unused-result)
+target_compile_options(whisper PRIVATE -O3 -march=native -std=c++26 -Wno-unused-result)
 target_link_libraries(whisper PUBLIC backend_manager hip::host)
 
 # -- libpixtral : Pixtral (Mistral) vision-language connector --------------------------
@@ -492,7 +559,7 @@ add_library(pixtral STATIC src/pixtral.cpp)
 target_include_directories(pixtral PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>)
-target_compile_options(pixtral PRIVATE -O3 -march=native -std=c++23 -Wno-unused-result)
+target_compile_options(pixtral PRIVATE -O3 -march=native -std=c++26 -Wno-unused-result)
 target_link_libraries(pixtral PUBLIC vision_encoder backend_manager vl_image)
 
 
@@ -543,8 +610,12 @@ set(BACKEND_MANAGER_SOURCES
     src/glm_moe_dsa.cpp
     src/mimo_v2.cpp
     src/qwen3_5.cpp
+    src/qwen3next_engine.cpp   # Qwen3-Next (GatedDeltaNet) CPU engine — #1831 interim fallback
     src/backend_laguna.cpp
     src/backend_zamba2.cpp
+    src/backend_lse.cpp
+    src/backend_hrx.cpp
+    src/hrx_inprocess.cpp
     src/simple_tokenizer.cpp
     src/q4nx_reader.cpp
     src/safetensors_reader.cpp
@@ -623,7 +694,7 @@ add_executable(ppl_generic
     src/q4nx_reader.cpp
     src/safetensors_reader.cpp)
 target_include_directories(ppl_generic PRIVATE src include engine/npu/src)
-target_compile_options(ppl_generic PRIVATE -O3 -march=native -std=c++23)
+target_compile_options(ppl_generic PRIVATE -O3 -march=native -std=c++26)
 if(OpenMP_CXX_FOUND)
     target_link_libraries(ppl_generic PRIVATE OpenMP::OpenMP_CXX)
 endif()
@@ -633,19 +704,19 @@ endif()
 # gate corpus with it into ppl_generic's jsonl format.
 add_executable(gguf_htok tools/gguf_htok.cpp src/gguf_reader.cpp)
 target_include_directories(gguf_htok PRIVATE src include)
-target_compile_options(gguf_htok PRIVATE -O2 -std=c++23)
+target_compile_options(gguf_htok PRIVATE -O2 -std=c++26)
 add_executable(make_gate tools/make_gate.cpp src/tokenizer.cpp)
 target_include_directories(make_gate PRIVATE src include)
-target_compile_options(make_gate PRIVATE -O2 -std=c++23)
+target_compile_options(make_gate PRIVATE -O2 -std=c++26)
 
 target_include_directories(backend_manager PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>)
 target_include_directories(backend_manager PRIVATE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>)
-target_include_directories(backend_manager PRIVATE "${ROCM_ROOT}/include")
+target_include_directories(backend_manager PRIVATE "${ROCM_INCLUDE_DIR}")
 target_compile_definitions(backend_manager PRIVATE __HIP_PLATFORM_AMD__=1)
-target_link_libraries(backend_manager PUBLIC dl rocm_cpp hip::host hip::device)
+target_link_libraries(backend_manager PUBLIC dl rocm_cpp hip::host hip::device nlohmann_json::nlohmann_json)
 if(RCPP_HAVE_CUDA)
     target_link_libraries(backend_manager PUBLIC cuda_engine)
 endif()
@@ -664,7 +735,7 @@ if(onnxruntime_FOUND)
     target_include_directories(backend_manager PRIVATE ${ONNXRUNTIME_INCLUDE_DIRS})
     target_link_libraries(backend_manager PRIVATE onnxruntime::onnxruntime)
 endif()
-target_compile_options(backend_manager PRIVATE -O3 -march=native -Wall -Wno-unused-result -std=c++23)
+target_compile_options(backend_manager PRIVATE -O3 -march=native -Wall -Wno-unused-result -std=c++26)
 # NOTE: no -ffast-math here (deliberately) — it implies -ffinite-math-only and
 # reassociation; it made the generic backend's expf-based SiLU produce NaN for
 # large SwiGLU gates (issue #1243 re-conversion gate: Qwen3-8B ppl 58k vs 7.35
@@ -698,7 +769,7 @@ target_include_directories(onebit_engine PUBLIC
     $<INSTALL_INTERFACE:include>)
 target_include_directories(onebit_engine PRIVATE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>)
-target_compile_options(onebit_engine PRIVATE -O2 -std=c++23 -fPIC)
+target_compile_options(onebit_engine PRIVATE -O2 -std=c++26 -fPIC)
 target_link_libraries(onebit_engine PRIVATE backend_manager dl)
 target_link_options(onebit_engine PRIVATE -rdynamic)
 set_target_properties(onebit_engine PROPERTIES OUTPUT_NAME "onebit")
@@ -713,7 +784,7 @@ target_include_directories(rocm_cpp PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>)
 target_include_directories(rocm_cpp PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/kernels)
-target_include_directories(rocm_cpp SYSTEM PRIVATE "${ROCM_ROOT}/include")
+target_include_directories(rocm_cpp SYSTEM PRIVATE "${ROCM_INCLUDE_DIR}")
 target_compile_definitions(rocm_cpp PRIVATE MAMBA1_ENGINE_AS_LIB=1)
 target_compile_options(rocm_cpp PRIVATE
     $<$<COMPILE_LANGUAGE:HIP>:-O3 -ffast-math -munsafe-fp-atomics
@@ -840,7 +911,7 @@ add_test(NAME zaya_batch_check COMMAND zaya_batch_check ${ZAYA_TEST_MODEL})
 
 # -- zaya_server : multi-model multi-backend inference server (main binary,
 #    NOT a test — not registered with add_test(), see install() below) ------
-set(ZAYA_SERVER_SRC tests/zaya_server.cpp tests/backends/backend_cpu.cpp tests/backends/backend_npu.cpp tests/backends/backend_generic.cpp tests/backends/backend_zamba2_adapter.cpp src/backend_zamba2.cpp)
+set(ZAYA_SERVER_SRC tests/zaya_server.cpp tests/backends/backend_cpu.cpp tests/backends/backend_npu.cpp tests/backends/backend_npu_universal.cpp tests/backends/backend_generic.cpp tests/backends/backend_zamba2_adapter.cpp src/backend_zamba2.cpp)
 
 # ── Speculative decode demo: draft + target llama.cpp contexts, batched
 # verification with KV rollback (roadmap Phase 2 core loop) ──
@@ -851,7 +922,10 @@ if(TARGET ggml_vulkan)
         "${GGML_BUILD_DIR}/src/libllama.a" "${GGML_BUILD_DIR}/common/libllama-common.a"
         "${GGML_BUILD_DIR}/common/libllama-common-base.a"
         ggml ggml_cpu ggml_base ggml_vulkan -lvulkan -ldl -lpthread -lm)
-    target_compile_options(spec_decode PRIVATE -O3 -std=c++17)
+    if(OpenMP_CXX_FOUND)
+        target_link_libraries(spec_decode PRIVATE OpenMP::OpenMP_CXX)
+    endif()
+    target_compile_options(spec_decode PRIVATE -O3 -std=c++26)
 endif()
 
 # ── Zaya GGUF-vs-BF16 logit validation ──
@@ -865,7 +939,10 @@ if(TARGET ggml_vulkan)
         "${GGML_BUILD_DIR}/src/libllama.a" "${GGML_BUILD_DIR}/common/libllama-common.a"
         "${GGML_BUILD_DIR}/common/libllama-common-base.a"
         ggml ggml_cpu ggml_base ggml_vulkan -lvulkan -ldl -lpthread -lm)
-    target_compile_options(zaya_logit_check PRIVATE -O3 -std=c++17)
+    if(OpenMP_CXX_FOUND)
+        target_link_libraries(zaya_logit_check PRIVATE OpenMP::OpenMP_CXX)
+    endif()
+    target_compile_options(zaya_logit_check PRIVATE -O3 -std=c++26)
 endif()
 if(RCPP_HAVE_VULKAN)
     list(APPEND ZAYA_SERVER_SRC tests/backends/backend_vulkan.cpp)
@@ -913,12 +990,24 @@ target_link_libraries(test_medusa_skeleton PRIVATE rocm_cpp)
 # -- bench_hip_1bp: GPU 1BP engine standalone benchmark --
 add_executable(bench_hip_1bp tools/bench_hip_1bp.cpp src/backend_hip_1bp.cpp src/kv_cache_attn.hip)
 target_include_directories(bench_hip_1bp PRIVATE src include engine/fusion/zero_copy engine/npu/src)
-target_compile_options(bench_hip_1bp PRIVATE -O2 -std=c++23 -D__HIP_PLATFORM_AMD__ -DRCPP_HAVE_FUSION_ZERO_COPY)
+target_compile_options(bench_hip_1bp PRIVATE -O2 -std=c++26 -D__HIP_PLATFORM_AMD__ -DRCPP_HAVE_FUSION_ZERO_COPY)
 target_link_libraries(bench_hip_1bp PRIVATE hip::host hip::device hipblas rocm_cpp)  # keep rocm_cpp; kernel-name collision fixed by h1bp_ prefix (issue #1212)
 if(THEROCK_HIPBLAS_LIB)
     get_filename_component(_l "${THEROCK_HIPBLAS_LIB}" DIRECTORY)
     set_property(TARGET bench_hip_1bp APPEND PROPERTY LINK_OPTIONS "-Wl,-rpath,${_l}")
 endif()
+
+# -- bench_cpu: f32 CPU-generic token ground truth (attention is pure f32) --
+add_executable(bench_cpu
+    tools/bench_cpu.cpp src/backend_generic.cpp
+    src/model_discovery.cpp src/gguf_reader.cpp
+    src/q4nx_reader.cpp src/safetensors_reader.cpp)
+target_include_directories(bench_cpu PRIVATE src include engine/npu/src)
+target_compile_options(bench_cpu PRIVATE -O3 -march=native -std=c++26)
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(bench_cpu PRIVATE OpenMP::OpenMP_CXX)
+endif()
+target_link_libraries(bench_cpu PRIVATE rocm_cpp)
 set_source_files_properties(tools/bench_hip_1bp.cpp PROPERTIES LANGUAGE CXX)
 set_target_properties(bench_hip_1bp PROPERTIES
     HIP_ARCHITECTURES "${CMAKE_HIP_ARCHITECTURES}"
@@ -926,7 +1015,7 @@ set_target_properties(bench_hip_1bp PROPERTIES
 
 add_executable(test_backend tests/test_backend.cpp)
 target_include_directories(test_backend PRIVATE src)
-target_compile_options(test_backend PRIVATE -O3 -Wall -Wno-unused-result -std=c++23)
+target_compile_options(test_backend PRIVATE -O3 -Wall -Wno-unused-result -std=c++26)
 target_link_libraries(test_backend PRIVATE backend_manager)
 
 set(BONSAI_H1B_MODEL "" CACHE FILEPATH "Path to a Bonsai .h1b model for test_bonsai_e2e (empty = skip)")
@@ -963,7 +1052,7 @@ set_tests_properties(test_moe_fused_math PROPERTIES LABELS "host")
 # coverage. No GPU, no model download; builds tokenizer.cpp standalone.
 add_executable(test_tokenizer_logprobs tests/test_tokenizer_logprobs.cpp src/tokenizer.cpp)
 target_include_directories(test_tokenizer_logprobs PRIVATE include include/rocm_cpp)
-target_compile_options(test_tokenizer_logprobs PRIVATE -O2 -std=c++17 -Wall)
+target_compile_options(test_tokenizer_logprobs PRIVATE -O2 -std=c++26 -Wall)
 target_link_libraries(test_tokenizer_logprobs PRIVATE m)
 add_test(NAME test_tokenizer_logprobs COMMAND test_tokenizer_logprobs)
 set_tests_properties(test_tokenizer_logprobs PROPERTIES LABELS "host")
@@ -1007,7 +1096,7 @@ set_tests_properties(test_sherry_e2e       PROPERTIES LABELS "gpu_required;model
 # backend_generic).
 set(GGUF_TEST_MODEL "" CACHE FILEPATH "Path to a non-Zaya GGUF model for test_generic_attention (empty = skip)")
 add_executable(test_generic_attention tests/test_generic_attention.cpp tests/backends/backend_generic.cpp)
-target_compile_options(test_generic_attention PRIVATE -O3 -Wall -Wno-unused-result -std=c++23)
+target_compile_options(test_generic_attention PRIVATE -O3 -Wall -Wno-unused-result -std=c++26)
 target_include_directories(test_generic_attention PRIVATE
     ${CMAKE_SOURCE_DIR}/tests
     ${CMAKE_SOURCE_DIR}/tests/backends
@@ -1024,7 +1113,7 @@ target_link_libraries(bitnet_decode PRIVATE rocm_cpp hip::host hip::device httpl
 set_target_properties(bitnet_decode PROPERTIES HIP_ARCHITECTURES "${CMAKE_HIP_ARCHITECTURES}")
 
 add_executable(hadamard_export tools/hadamard_export.cpp)
-target_compile_options(hadamard_export PRIVATE -O3 -Wall -Wno-unused-result -std=c++23)
+target_compile_options(hadamard_export PRIVATE -O3 -Wall -Wno-unused-result -std=c++26)
 target_link_libraries(hadamard_export PRIVATE rocm_cpp)
 
 add_executable(bitnet_debate tools/bitnet_debate.cpp)
@@ -1098,6 +1187,12 @@ set(UNIFIED_SERVER_SOURCES
     src/backend_generic.cpp
 )
 
+# LSE / HRX backends (backend_lse.cpp, backend_hrx.cpp, hrx_inprocess.cpp)
+# live in BACKEND_MANAGER_SOURCES, not here: backend_manager.cpp calls their
+# create_*_backend() factories directly, so the symbols must be in the
+# backend_manager lib for every consumer (onebin links backend_manager, so it
+# still gets them transitively).
+
 # ggml_vulkan backend needs llama.cpp's static libs (GGML_BUILD_DIR); only
 # compile it when they exist — the factory is dlsym-dispatched, so an absent
 # backend just registers unavailable at runtime.
@@ -1113,15 +1208,21 @@ endif()
 # backend just registers as unavailable at runtime — safe to exclude.
 find_package(xrt QUIET)
 find_package(aiebu QUIET)
+# The fused backend imports the NPU SharedBO dma-buf as Vulkan device memory
+# (issue #1217) — vulkan_rt.h needs the Vulkan headers and libvulkan at link.
+find_package(Vulkan QUIET)
 include(CheckIncludeFile)
 check_include_file("xrt/xrt_bo.h" _RC_XRT_BO_H)
 set(_RC_HAVE_FUSED_BACKEND FALSE)
-if(hip_FOUND AND xrt_FOUND AND aiebu_FOUND AND _RC_XRT_BO_H)
+if(hip_FOUND AND xrt_FOUND AND aiebu_FOUND AND _RC_XRT_BO_H AND Vulkan_FOUND)
     set(_RC_HAVE_FUSED_BACKEND TRUE)
-    list(APPEND UNIFIED_SERVER_SOURCES src/backend_fused.cpp src/backend_fused_npu.cpp)
-    message(STATUS "rocm-cpp: fused GPU+NPU backend enabled (XRT + AIEBU headers present)")
+    list(APPEND UNIFIED_SERVER_SOURCES
+        src/backend_fused.cpp src/backend_fused_npu.cpp
+        engine/fusion/gpu_attn_vk/gpu_attn_vk.cpp)
+    set_source_files_properties(engine/fusion/gpu_attn_vk/gpu_attn_vk.cpp PROPERTIES LANGUAGE CXX)
+    message(STATUS "rocm-cpp: fused GPU+NPU backend enabled (XRT + AIEBU + Vulkan present)")
 else()
-    message(STATUS "rocm-cpp: fused GPU+NPU backend disabled (XRT headers or AIEBU missing)")
+    message(STATUS "rocm-cpp: fused GPU+NPU backend disabled (XRT/AIEBU headers or Vulkan missing)")
 endif()
 
 # unified_server sources (UNIFIED_SERVER_SOURCES, kept above) compile into
@@ -1155,7 +1256,7 @@ list(APPEND UNIFIED_SERVER_SOURCES ${MESH_SOURCES})
 
 add_executable(mesh_peer tools/mesh_peer.cpp ${MESH_SOURCES})
 target_include_directories(mesh_peer PRIVATE ${CMAKE_SOURCE_DIR}/src)
-target_compile_options(mesh_peer PRIVATE -O2 -Wall -Wno-unused-result -std=c++23)
+target_compile_options(mesh_peer PRIVATE -O2 -Wall -Wno-unused-result -std=c++26)
 target_link_libraries(mesh_peer PRIVATE httplib::httplib nlohmann_json::nlohmann_json)
 # FastFlowLM (flm) is now an official AMD/ROCm project, shipped prebuilt:
 #   - built into the TheRock dist (7.14 / 7.15a) at <therock-root>/bin/flm
@@ -1274,18 +1375,18 @@ endif()
 
 add_executable(backend_demo tools/backend_demo.cpp)
 target_include_directories(backend_demo PRIVATE src/)
-target_compile_options(backend_demo PRIVATE -O3 -march=native -Wall -Wno-unused-result -std=c++23)
+target_compile_options(backend_demo PRIVATE -O3 -march=native -Wall -Wno-unused-result -std=c++26)
 target_link_libraries(backend_demo PRIVATE backend_manager dl)
 
 add_executable(test_mamba1_backend tools/test_mamba1_backend.cpp)
 target_include_directories(test_mamba1_backend PRIVATE src/ include/)
-target_compile_options(test_mamba1_backend PRIVATE -O3 -Wall -Wno-unused-result -std=c++23)
+target_compile_options(test_mamba1_backend PRIVATE -O3 -Wall -Wno-unused-result -std=c++26)
 target_link_libraries(test_mamba1_backend PRIVATE backend_manager dl)
 
 add_executable(test_mamba2_kernels tools/test_mamba2_kernels.cpp)
 target_include_directories(test_mamba2_kernels PRIVATE src/ include/)
 target_compile_options(test_mamba2_kernels PRIVATE
-    $<$<COMPILE_LANGUAGE:CXX>:-O3 -Wall -Wno-unused-result -std=c++23>
+    $<$<COMPILE_LANGUAGE:CXX>:-O3 -Wall -Wno-unused-result -std=c++26>
     $<$<COMPILE_LANGUAGE:HIP>:-O3 -Wno-unused-result>)
 set_source_files_properties(tools/test_mamba2_kernels.cpp PROPERTIES LANGUAGE HIP)
 target_link_libraries(test_mamba2_kernels PRIVATE rocm_cpp hip::host hip::device)
@@ -1304,7 +1405,7 @@ set_tests_properties(test_mamba2_kernels_validation PROPERTIES LABELS "gpu_requi
 # ── Zamba2 regression test (attention correctness, issue #946) ──
 add_executable(test_zamba2_regression tools/test_zamba2_regression.cpp)
 target_include_directories(test_zamba2_regression PRIVATE src/ include/)
-target_compile_options(test_zamba2_regression PRIVATE -O3 -Wall -Wno-unused-result -std=c++23)
+target_compile_options(test_zamba2_regression PRIVATE -O3 -Wall -Wno-unused-result -std=c++26)
 target_link_libraries(test_zamba2_regression PRIVATE backend_manager rocm_cpp)
 set(ZAMBA2_TEST_MODEL "models/zamba2-1.2b-instruct-v2-q4_0.gguf" CACHE FILEPATH "GGUF model for test_zamba2_regression")
 if(ZAMBA2_TEST_MODEL AND EXISTS "${ZAMBA2_TEST_MODEL}")
@@ -1317,7 +1418,7 @@ endif()
 if(RCPP_HAVE_CUDA)
     add_executable(test_cuda_backend tools/test_cuda_backend.cpp)
     target_include_directories(test_cuda_backend PRIVATE src/ include/)
-    target_compile_options(test_cuda_backend PRIVATE -O3 -Wall -Wno-unused-result -std=c++23)
+    target_compile_options(test_cuda_backend PRIVATE -O3 -Wall -Wno-unused-result -std=c++26)
     target_link_libraries(test_cuda_backend PRIVATE backend_manager)
 endif()
 
@@ -1325,7 +1426,7 @@ endif()
 if(RCPP_HAVE_METAL)
     add_executable(test_metal_backend tools/test_metal_backend.cpp)
     target_include_directories(test_metal_backend PRIVATE src/ include/)
-    target_compile_options(test_metal_backend PRIVATE -O3 -Wall -Wno-unused-result -std=c++23)
+    target_compile_options(test_metal_backend PRIVATE -O3 -Wall -Wno-unused-result -std=c++26)
     target_link_libraries(test_metal_backend PRIVATE backend_manager)
 endif()
 if(ZINC_CPP_AVAILABLE)
@@ -1334,7 +1435,7 @@ endif()
 
 add_executable(vision_qwen2vl_poc tools/vision_qwen2vl_poc.cpp)
 target_include_directories(vision_qwen2vl_poc PRIVATE src/)
-target_compile_options(vision_qwen2vl_poc PRIVATE -O3 -Wall -Wno-unused-result -std=c++23)
+target_compile_options(vision_qwen2vl_poc PRIVATE -O3 -Wall -Wno-unused-result -std=c++26)
 target_link_libraries(vision_qwen2vl_poc PRIVATE backend_manager vl_image dl)
 
 # -- vision_server : HTTP server for vision-language inference ---------------
@@ -1347,7 +1448,7 @@ target_link_libraries(vision_qwen2vl_poc PRIVATE backend_manager vl_image dl)
 # -- vl_logit_check : logit-level 1BP-vs-BF16 decoder validation -----------
 add_executable(vl_logit_check tools/vl_logit_check.cpp src/tokenizer.cpp)
 target_include_directories(vl_logit_check PRIVATE src/ include/ engine/npu/src)
-target_compile_options(vl_logit_check PRIVATE -O3 -Wall -Wno-unused-result -std=c++23)
+target_compile_options(vl_logit_check PRIVATE -O3 -Wall -Wno-unused-result -std=c++26)
 target_link_libraries(vl_logit_check PRIVATE backend_manager onebp_model dl)
 
 # -- unified_router : NPU+GPU content-aware routing proxy -------------------
@@ -1408,7 +1509,7 @@ target_include_directories(onebin PRIVATE
     ${CMAKE_SOURCE_DIR}/tests/backends)
 target_compile_options(onebin PRIVATE
     $<$<COMPILE_LANGUAGE:HIP>:-O3 -Wno-unused-result>
-    $<$<COMPILE_LANGUAGE:CXX>:-O3 -Wall -Wno-unused-result -std=c++23 -fopenmp>)
+    $<$<COMPILE_LANGUAGE:CXX>:-O3 -Wall -Wno-unused-result -std=c++26 -fopenmp>)
 target_link_libraries(onebin PRIVATE
     backend_manager vl_image vision_encoder whisper dl
     rocm_cpp hip::host hip::device httplib::httplib
@@ -1420,6 +1521,11 @@ if(TARGET ggml_vulkan)
         "${GGML_BUILD_DIR}/common/libllama-common.a"
         "${GGML_BUILD_DIR}/common/libllama-common-base.a"
         -lvulkan -ldl -lpthread -lm)
+    # backend_ggml_vulkan.h declares the real factory only under this define;
+    # without it the header self-stubs to nullptr so onebin still links when
+    # llama.cpp's static libs weren't pre-built (its headers may still be
+    # present via recursive submodules — header presence != backend linked).
+    target_compile_definitions(onebin PRIVATE GGML_VULKAN_LINKED=1)
 endif()
 if(EMBED_LEMONADE)
     target_link_libraries(onebin PRIVATE lemonade-server-core)
@@ -1454,7 +1560,7 @@ endif()
 # -- zaya1_vl_demo : ZAYA1-VL-8B vision-language inference demo -------------
 add_executable(zaya1_vl_demo tools/zaya1_vl_demo.cpp)
 target_include_directories(zaya1_vl_demo PRIVATE src/ include/)
-target_compile_options(zaya1_vl_demo PRIVATE -O3 -Wall -Wno-unused-result -std=c++23)
+target_compile_options(zaya1_vl_demo PRIVATE -O3 -Wall -Wno-unused-result -std=c++26)
 target_link_libraries(zaya1_vl_demo PRIVATE
     backend_manager vision_encoder vl_image dl
     ${CMAKE_DL_LIBS})
@@ -1462,7 +1568,7 @@ target_link_libraries(zaya1_vl_demo PRIVATE
 # -- whisper_demo : Whisper speech-to-text demo -----------------------------------------
 add_executable(whisper_demo tools/whisper_demo.cpp)
 target_include_directories(whisper_demo PRIVATE src/ include/)
-target_compile_options(whisper_demo PRIVATE -O3 -Wall -Wno-unused-result -std=c++23 -fopenmp)
+target_compile_options(whisper_demo PRIVATE -O3 -Wall -Wno-unused-result -std=c++26 -fopenmp)
 target_link_libraries(whisper_demo PRIVATE
     whisper backend_manager vl_image dl
     ${CMAKE_DL_LIBS})
@@ -1471,12 +1577,12 @@ target_link_libraries(whisper_demo PRIVATE
 # whisper models -> this project's own strict-GGUF format). Not part of
 # the runtime product; only used to prepare a model file for JARVIS STT.
 add_executable(whisper_ggml_to_gguf tools/whisper_ggml_to_gguf.cpp)
-target_compile_options(whisper_ggml_to_gguf PRIVATE -O3 -Wall -Wno-unused-result -std=c++23)
+target_compile_options(whisper_ggml_to_gguf PRIVATE -O3 -Wall -Wno-unused-result -std=c++26)
 
 # -- test_vit_encoder : Standalone ViT encoder test ---------------------------------
 add_executable(test_vit_encoder tools/test_vit_encoder.cpp)
 target_include_directories(test_vit_encoder PRIVATE src/ include/)
-target_compile_options(test_vit_encoder PRIVATE -O3 -Wall -Wno-unused-result -std=c++23)
+target_compile_options(test_vit_encoder PRIVATE -O3 -Wall -Wno-unused-result -std=c++26)
 target_link_libraries(test_vit_encoder PRIVATE
     vision_encoder backend_manager vl_image dl
     ${CMAKE_DL_LIBS})
@@ -1484,7 +1590,7 @@ target_link_libraries(test_vit_encoder PRIVATE
 # -- vl_pipeline_test : End-to-end VL pipeline architecture test -------------------
 add_executable(vl_pipeline_test tools/vl_pipeline_test.cpp)
 target_include_directories(vl_pipeline_test PRIVATE src/ include/)
-target_compile_options(vl_pipeline_test PRIVATE -O3 -Wall -Wno-unused-result -std=c++23)
+target_compile_options(vl_pipeline_test PRIVATE -O3 -Wall -Wno-unused-result -std=c++26)
 target_link_libraries(vl_pipeline_test PRIVATE
     vision_encoder backend_manager vl_image dl
     ${CMAKE_DL_LIBS})
@@ -1520,7 +1626,7 @@ if(TARGET npu_engine_hybrid)
     # -ffast-math implies -ffinite-math-only and compiles the std::isfinite
     # NaN/Inf masks out (issue #1277) — keep them alive.
     target_compile_options(npu_engine_hybrid PRIVATE
-        -O3 -march=native -std=c++23 -fopenmp)
+        -O3 -march=native -std=c++26 -fopenmp)
     target_link_libraries(npu_engine_hybrid PRIVATE xrt_coreutil uuid rt pthread)
     target_link_options(npu_engine_hybrid PRIVATE
         -L${THEROCK_SDK_BASE}/lib -lamdhip64 -Wl,-rpath,${THEROCK_SDK_BASE}/lib -fopenmp)
@@ -1547,7 +1653,7 @@ if(TARGET qwen36_moe_probe)
         ${CMAKE_SOURCE_DIR}/third_party/FastFlowLM/src/include
         ${CMAKE_SOURCE_DIR}/third_party/FastFlowLM/src/include/npu_utils)
     target_compile_options(qwen36_moe_probe PRIVATE
-        -O2 -std=c++20 -fopenmp)
+        -O2 -std=c++26 -fopenmp)
     target_link_libraries(qwen36_moe_probe PRIVATE
         xrt_coreutil xrt_core aiebu uuid m dl pthread)
     target_link_options(qwen36_moe_probe PRIVATE
@@ -1566,7 +1672,7 @@ target_include_directories(gen_npu_insts PRIVATE
     ${CMAKE_SOURCE_DIR}/npu-infer/include
     ${CMAKE_SOURCE_DIR}/third_party/FastFlowLM/src/include
     ${CMAKE_SOURCE_DIR}/third_party/FastFlowLM/src/include/npu_utils)
-target_compile_options(gen_npu_insts PRIVATE -O2 -std=c++20)
+target_compile_options(gen_npu_insts PRIVATE -O2 -std=c++26)
 target_link_libraries(gen_npu_insts PRIVATE uuid)
 set_target_properties(gen_npu_insts PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/build)
@@ -1594,7 +1700,7 @@ if(_RC_HAVE_FUSED_BACKEND)
         target_compile_options(fusion_zero_copy PRIVATE
             -g -O3 -march=native -fno-signed-zeros -fno-trapping-math -fassociative-math
             -freciprocal-math -fno-math-errno -fno-rounding-math
-            -std=c++23 -D__HIP_PLATFORM_AMD__)
+            -std=c++26 -D__HIP_PLATFORM_AMD__)
         target_link_libraries(fusion_zero_copy PUBLIC
             xrt_coreutil xrt_core uuid rt pthread
             /usr/lib/x86_64-linux-gnu/libaiebu.a)
@@ -1612,26 +1718,126 @@ if(_RC_HAVE_FUSED_BACKEND)
             target_link_libraries(onebin PRIVATE fusion_zero_copy)
             target_include_directories(onebin PRIVATE engine/fusion/zero_copy)
             target_compile_definitions(onebin PRIVATE RCPP_HAVE_FUSION_ZERO_COPY=1)
+            # backend_fused.cpp (compiled into onebin) imports the SharedBO
+            # dma-bufs via Vulkan (issue #1217) — give it the loader + headers.
+            target_link_libraries(onebin PRIVATE Vulkan::Vulkan)
+            target_include_directories(onebin PRIVATE ${Vulkan_INCLUDE_DIRS})
+            # gpu_attn_vk.cpp (Vulkan in-place attention on the NPU pages).
+            target_include_directories(onebin PRIVATE engine/fusion/gpu_attn_vk)
         endif()
 
         # bench_fused: Fused GPU attn ∥ NPU FFN benchmark
-        add_executable(bench_fused tools/bench_fused.cpp src/backend_fused.cpp src/backend_fused_npu.cpp src/kv_cache_attn.hip)
+        # gpu_attn_vk.cpp = Vulkan in-place attention on the NPU pages (pure C++).
+        add_executable(bench_fused tools/bench_fused.cpp src/backend_fused.cpp src/backend_fused_npu.cpp src/kv_cache_attn.hip engine/fusion/gpu_attn_vk/gpu_attn_vk.cpp)
         set_source_files_properties(src/backend_fused.cpp PROPERTIES LANGUAGE HIP)
         set_source_files_properties(src/backend_fused_npu.cpp PROPERTIES LANGUAGE CXX)
         set_source_files_properties(src/kv_cache_attn.hip PROPERTIES LANGUAGE HIP)
-        target_include_directories(bench_fused PRIVATE src include engine/fusion/zero_copy engine/npu/src)
-        target_compile_options(bench_fused PRIVATE -O2 -std=c++23 -D__HIP_PLATFORM_AMD__ -DRCPP_HAVE_FUSION_ZERO_COPY)
-        target_link_libraries(bench_fused PRIVATE fusion_zero_copy hip::host hip::device hipblas rocm_cpp pthread)
+        set_source_files_properties(engine/fusion/gpu_attn_vk/gpu_attn_vk.cpp PROPERTIES LANGUAGE CXX)
+        target_include_directories(bench_fused PRIVATE src include engine/fusion/zero_copy engine/fusion/gpu_attn_vk engine/npu/src ${Vulkan_INCLUDE_DIRS})
+
+        # parity_fused: real-prompt, logits-level parity between fused modes
+        # (GPU/NPU FFN, HIP/VK attention) — the regression gate for shader and
+        # kernel rewrites (catches int8-boundary token flips that a degenerate
+        # token-stream check would miss).
+        add_executable(parity_fused tools/parity_fused.cpp src/backend_fused.cpp src/backend_fused_npu.cpp src/kv_cache_attn.hip engine/fusion/gpu_attn_vk/gpu_attn_vk.cpp)
+        set_source_files_properties(tools/parity_fused.cpp PROPERTIES LANGUAGE CXX)
+        set_source_files_properties(src/backend_fused.cpp PROPERTIES LANGUAGE HIP)
+        set_source_files_properties(src/backend_fused_npu.cpp PROPERTIES LANGUAGE CXX)
+        set_source_files_properties(src/kv_cache_attn.hip PROPERTIES LANGUAGE HIP)
+        set_source_files_properties(engine/fusion/gpu_attn_vk/gpu_attn_vk.cpp PROPERTIES LANGUAGE CXX)
+        target_include_directories(parity_fused PRIVATE src include engine/fusion/zero_copy engine/fusion/gpu_attn_vk engine/npu/src ${Vulkan_INCLUDE_DIRS})
+        target_compile_options(parity_fused PRIVATE -O2 -std=c++26 -D__HIP_PLATFORM_AMD__ -DRCPP_HAVE_FUSION_ZERO_COPY)
+        target_link_libraries(parity_fused PRIVATE fusion_zero_copy hip::host hip::device hipblas rocm_cpp pthread Vulkan::Vulkan)
+        if(GLSLC_EXECUTABLE)
+            add_dependencies(parity_fused gpu_attn_vk_shaders)
+        endif()
+        set_target_properties(parity_fused PROPERTIES
+            HIP_ARCHITECTURES "${CMAKE_HIP_ARCHITECTURES}"
+            RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+
+        # bench_fused_batch: multi-sequence batch decode (FUSED_BATCH=N)
+        add_executable(bench_fused_batch tools/bench_fused_batch.cpp src/backend_fused.cpp src/backend_fused_npu.cpp src/kv_cache_attn.hip engine/fusion/gpu_attn_vk/gpu_attn_vk.cpp)
+        set_source_files_properties(tools/bench_fused_batch.cpp PROPERTIES LANGUAGE CXX)
+        set_source_files_properties(src/backend_fused.cpp PROPERTIES LANGUAGE HIP)
+        set_source_files_properties(src/backend_fused_npu.cpp PROPERTIES LANGUAGE CXX)
+        set_source_files_properties(src/kv_cache_attn.hip PROPERTIES LANGUAGE HIP)
+        set_source_files_properties(engine/fusion/gpu_attn_vk/gpu_attn_vk.cpp PROPERTIES LANGUAGE CXX)
+        target_include_directories(bench_fused_batch PRIVATE src include engine/fusion/zero_copy engine/fusion/gpu_attn_vk engine/npu/src ${Vulkan_INCLUDE_DIRS})
+        target_compile_options(bench_fused_batch PRIVATE -O2 -std=c++26 -D__HIP_PLATFORM_AMD__ -DRCPP_HAVE_FUSION_ZERO_COPY)
+        target_link_libraries(bench_fused_batch PRIVATE fusion_zero_copy hip::host hip::device hipblas rocm_cpp pthread Vulkan::Vulkan)
+        if(GLSLC_EXECUTABLE)
+            add_dependencies(bench_fused_batch gpu_attn_vk_shaders)
+        endif()
+        set_target_properties(bench_fused_batch PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+
+        # npu_stability_probe: out-of-process NPU stability gate.  The fused
+        # backend execs this before enabling USE_NPU_FFN; if the XRT/amdxdna
+        # driver crashes after repeated AIE GEMMs, it dies HERE (in the probe),
+        # and the backend falls back to GPU-only instead of crashing the server.
+        add_executable(npu_stability_probe tools/npu_stability_probe.cpp)
+        set_source_files_properties(tools/npu_stability_probe.cpp PROPERTIES LANGUAGE CXX)
+        target_include_directories(npu_stability_probe PRIVATE src include engine/fusion/zero_copy engine/npu/src)
+        target_compile_options(npu_stability_probe PRIVATE -O2 -std=c++26)
+        target_link_libraries(npu_stability_probe PRIVATE fusion_zero_copy)
+        set_target_properties(npu_stability_probe PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+
+        # gpu_attn_vk GLSL shaders → SPIR-V into the build tree; the backend
+        # loads them from VK_ATTN_SHADER_DIR (compile-time default below).
+        find_program(GLSLC_EXECUTABLE glslc)
+        if(GLSLC_EXECUTABLE)
+            set(VK_ATTN_SHADER_DIR "${CMAKE_BINARY_DIR}/gpu_attn_vk_shaders")
+            file(MAKE_DIRECTORY "${VK_ATTN_SHADER_DIR}")
+            set(VK_ATTN_SPVS "")
+            file(GLOB VK_ATTN_COMP "${CMAKE_SOURCE_DIR}/engine/fusion/gpu_attn_vk/shaders/*.comp")
+            foreach(_comp ${VK_ATTN_COMP})
+                get_filename_component(_name "${_comp}" NAME_WE)
+                set(_spv "${VK_ATTN_SHADER_DIR}/${_name}.spv")
+                add_custom_command(OUTPUT "${_spv}"
+                    COMMAND "${GLSLC_EXECUTABLE}" --target-env=vulkan1.2 -O -o "${_spv}" "${_comp}"
+                    DEPENDS "${_comp}"
+                    COMMENT "glslc ${_name}.comp -> ${_name}.spv")
+                list(APPEND VK_ATTN_SPVS "${_spv}")
+            endforeach()
+            add_custom_target(gpu_attn_vk_shaders DEPENDS ${VK_ATTN_SPVS})
+            add_dependencies(bench_fused gpu_attn_vk_shaders)
+            if(TARGET onebin)
+                add_dependencies(onebin gpu_attn_vk_shaders)
+                target_compile_definitions(onebin PRIVATE
+                    VK_ATTN_SHADER_DIR="${VK_ATTN_SHADER_DIR}")
+            endif()
+        else()
+            set(VK_ATTN_SHADER_DIR "${CMAKE_SOURCE_DIR}/engine/fusion/gpu_attn_vk/shaders")
+            if(TARGET onebin)
+                target_compile_definitions(onebin PRIVATE
+                    VK_ATTN_SHADER_DIR="${VK_ATTN_SHADER_DIR}")
+            endif()
+        endif()
+        target_compile_definitions(bench_fused PRIVATE
+            VK_ATTN_SHADER_DIR="${VK_ATTN_SHADER_DIR}")
+        target_compile_options(bench_fused PRIVATE -O2 -std=c++26 -D__HIP_PLATFORM_AMD__ -DRCPP_HAVE_FUSION_ZERO_COPY)
+        target_link_libraries(bench_fused PRIVATE fusion_zero_copy hip::host hip::device hipblas rocm_cpp pthread Vulkan::Vulkan)
         set_source_files_properties(tools/bench_fused.cpp PROPERTIES LANGUAGE CXX)
         set_target_properties(bench_fused PROPERTIES
             HIP_ARCHITECTURES "${CMAKE_HIP_ARCHITECTURES}"
             RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/build)
+        # Resolve HIP/hipblas at runtime from the SAME TheRock tree it was
+        # built against — without this the loader falls back to the apt system
+        # libamdhip64 at /usr/lib (bench_fused linked but crashed at startup).
+        set_property(TARGET bench_fused APPEND PROPERTY LINK_OPTIONS "-Wl,-rpath,\$ORIGIN")
+        if(THEROCK_HIPBLAS_LIB)
+            set_property(TARGET bench_fused APPEND PROPERTY
+                LINK_OPTIONS "-Wl,-rpath,${THEROCK_LIB_DIR}")
+        endif()
     endif()
 endif()
 
 # -- bench_ggml_vk: GGML-Vulkan backend benchmark (llama.cpp MIT License) ---
 if(TARGET ggml_vulkan)
     add_executable(bench_ggml_vk tools/bench_ggml_vk.cpp src/backend_ggml_vulkan.cpp)
+    # Same contract as onebin: bench_ggml_vk.cpp calls create_ggml_vulkan_backend()
+    # directly, so the real factory declaration must be visible in this target.
+    target_compile_definitions(bench_ggml_vk PRIVATE GGML_VULKAN_LINKED=1)
     target_include_directories(bench_ggml_vk PRIVATE
         include
         src
@@ -1673,7 +1879,7 @@ if(hip_FOUND AND xrt_FOUND AND aiebu_FOUND)
         target_compile_options(test_pipeline_real PRIVATE
             -g -O3 -march=native -fno-signed-zeros -fno-trapping-math -fassociative-math
             -freciprocal-math -fno-math-errno -fno-rounding-math
-            -std=c++23 -fopenmp -D__HIP_PLATFORM_AMD__)
+            -std=c++26 -fopenmp -D__HIP_PLATFORM_AMD__)
         target_link_libraries(test_pipeline_real PRIVATE
             fusion_zero_copy
             xrt_coreutil xrt_core uuid rt pthread
@@ -1702,7 +1908,7 @@ if(hip_FOUND AND xrt_FOUND AND aiebu_FOUND)
             ${CMAKE_SOURCE_DIR}/include
             ${THEROCK_SDK_BASE}/include)
         target_compile_options(test_npu_ffn_real_weights PRIVATE
-            -g -O2 -std=c++23 -D__HIP_PLATFORM_AMD__)
+            -g -O2 -std=c++26 -D__HIP_PLATFORM_AMD__)
         target_link_libraries(test_npu_ffn_real_weights PRIVATE
             xrt_coreutil xrt_core uuid rt pthread
             /usr/lib/x86_64-linux-gnu/libaiebu.a)
@@ -1732,7 +1938,7 @@ target_include_directories(dspark_full PRIVATE
     ${CMAKE_SOURCE_DIR}/include
     ${CMAKE_SOURCE_DIR})
 target_compile_options(dspark_full PRIVATE
-    -O3 -march=native -std=c++23 -fopenmp)
+    -O3 -march=native -std=c++26 -fopenmp)
 target_link_libraries(dspark_full PRIVATE
     rocm_cpp
     ${CMAKE_DL_LIBS} m pthread)
@@ -1755,7 +1961,7 @@ target_include_directories(dspark_gpu_bench PRIVATE
     ${CMAKE_SOURCE_DIR}/spec-decode
     ${THEROCK_SDK_BASE}/include)
 target_compile_options(dspark_gpu_bench PRIVATE
-    -O3 -march=native -std=c++23 -fopenmp -D__HIP_PLATFORM_AMD__)
+    -O3 -march=native -std=c++26 -fopenmp -D__HIP_PLATFORM_AMD__)
 target_link_libraries(dspark_gpu_bench PRIVATE
     rocm_cpp
     ${CMAKE_DL_LIBS} m pthread hipblas)
@@ -1775,7 +1981,7 @@ target_include_directories(trg_save PRIVATE
     ${CMAKE_SOURCE_DIR}/engine/fusion
     ${CMAKE_SOURCE_DIR})
 target_compile_options(trg_save PRIVATE
-    -O3 -march=native -std=c++23 -fopenmp)
+    -O3 -march=native -std=c++26 -fopenmp)
 target_link_libraries(trg_save PRIVATE
     ${CMAKE_DL_LIBS} m pthread)
 set_target_properties(trg_save PROPERTIES
@@ -1789,7 +1995,7 @@ target_include_directories(oscar_calib PRIVATE
     ${CMAKE_SOURCE_DIR}/engine/fusion
     ${CMAKE_SOURCE_DIR})
 target_compile_options(oscar_calib PRIVATE
-    -O3 -march=native -std=c++23 -fopenmp)
+    -O3 -march=native -std=c++26 -fopenmp)
 target_link_libraries(oscar_calib PRIVATE
     ${CMAKE_DL_LIBS} m pthread)
 set_target_properties(oscar_calib PROPERTIES
@@ -1803,7 +2009,7 @@ target_include_directories(oscar PRIVATE
     ${CMAKE_SOURCE_DIR}/include
     ${CMAKE_SOURCE_DIR})
 target_compile_options(oscar PRIVATE
-    -O3 -ffast-math -std=c++23)
+    -O3 -ffast-math -std=c++26)
 target_link_libraries(oscar PRIVATE
     ${CMAKE_DL_LIBS} m pthread)
 target_link_options(oscar PRIVATE
@@ -1821,7 +2027,7 @@ set_tests_properties(test_oscar_attn_decode PROPERTIES LABELS "gpu_required" SKI
 # -- tq2_to_q4nx : Convert 1BP TQ2 to Q4NX format for NPU inference ---------
 add_executable(tq2_to_q4nx tools/tq2_to_q4nx.cpp)
 target_include_directories(tq2_to_q4nx PRIVATE src/ ${CMAKE_SOURCE_DIR}/include)
-target_compile_options(tq2_to_q4nx PRIVATE -O3 -std=c++23)
+target_compile_options(tq2_to_q4nx PRIVATE -O3 -std=c++26)
 target_link_libraries(tq2_to_q4nx PRIVATE onebp_model pthread)
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1834,13 +2040,13 @@ if(USE_LORA)
     target_include_directories(lora_runtime PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:include>)
-    target_compile_options(lora_runtime PRIVATE -O3 -std=c++23 -fopenmp)
+    target_compile_options(lora_runtime PRIVATE -O3 -std=c++26 -fopenmp)
     target_link_libraries(lora_runtime PUBLIC gguf_reader)
     
     # LoRA merge tool: merge LoRA weights permanently into a GGUF
     add_executable(lora_merge tools/lora_merge.cpp)
     target_include_directories(lora_merge PRIVATE src/ include/)
-    target_compile_options(lora_merge PRIVATE -O3 -Wall -Wno-unused-result -std=c++23)
+    target_compile_options(lora_merge PRIVATE -O3 -Wall -Wno-unused-result -std=c++26)
     target_link_libraries(lora_merge PRIVATE lora_runtime backend_manager)
     
     message(STATUS "lora: LoRA adapter runtime enabled")
@@ -1880,7 +2086,7 @@ if(USE_DIFFUSION)
             $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/third_party/stable-diffusion.cpp/examples/common>
             $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/third_party/stable-diffusion.cpp/thirdparty>
             $<INSTALL_INTERFACE:include>)
-        target_compile_options(diffusion_bridge PRIVATE -O3 -std=c++23)
+        target_compile_options(diffusion_bridge PRIVATE -O3 -std=c++26)
         # Also find ggml libs that sd.cpp depends on
         set(SD_GGML_DIRS)
         foreach(d IN LISTS SD_CPP_DIRS)
@@ -1942,7 +2148,7 @@ if(USE_DIFFUSION)
         # Image generation server (OpenAI-compatible /v1/images/*)
         add_executable(image_server tools/image_server.cpp)
         target_include_directories(image_server PRIVATE src/ include/)
-        target_compile_options(image_server PRIVATE -O3 -Wall -Wno-unused-result -std=c++23)
+        target_compile_options(image_server PRIVATE -O3 -Wall -Wno-unused-result -std=c++26)
         target_link_libraries(image_server PRIVATE
             diffusion_bridge vl_image backend_manager
             httplib::httplib nlohmann_json::nlohmann_json)
@@ -1982,7 +2188,7 @@ if(USE_AUDIO_CPP)
         target_include_directories(audio_bridge PRIVATE
             ${AUDIO_CPP_DIR}/../include  # audio.cpp headers
             ${AUDIO_CPP_DIR}/../ggml/include)
-        target_compile_options(audio_bridge PRIVATE -O3 -std=c++23)
+        target_compile_options(audio_bridge PRIVATE -O3 -std=c++26)
         target_link_libraries(audio_bridge PUBLIC
             ${AUDIO_CPP_LIB}
             ${AUDIO_GGML_LIB}
@@ -2007,7 +2213,7 @@ endif()
 # LoRA runtime smoke test (no model required, tests error paths)
 add_executable(test_lora_runtime tests/test_lora_runtime.cpp)
 target_include_directories(test_lora_runtime PRIVATE include/)
-target_compile_options(test_lora_runtime PRIVATE -O3 -std=c++23)
+target_compile_options(test_lora_runtime PRIVATE -O3 -std=c++26)
 find_package(OpenMP QUIET)
 target_link_libraries(test_lora_runtime PRIVATE lora_runtime gguf_reader)
 if(OpenMP_CXX_FOUND)
@@ -2020,7 +2226,7 @@ set_tests_properties(test_lora_runtime PROPERTIES LABELS "host")
 if(USE_DIFFUSION)
     add_executable(test_diffusion_bridge tests/test_diffusion_bridge.cpp)
     target_include_directories(test_diffusion_bridge PRIVATE include/)
-    target_compile_options(test_diffusion_bridge PRIVATE -O3 -std=c++23)
+    target_compile_options(test_diffusion_bridge PRIVATE -O3 -std=c++26)
     target_link_libraries(test_diffusion_bridge PRIVATE diffusion_bridge vl_image)
     if(OpenMP_CXX_FOUND)
         target_link_libraries(test_diffusion_bridge PRIVATE OpenMP::OpenMP_CXX)
@@ -2063,12 +2269,12 @@ add_library(zaya_codec STATIC src/zaya_codec.cpp)
 target_include_directories(zaya_codec PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>)
-target_compile_options(zaya_codec PRIVATE -O3 -std=c++17)
+target_compile_options(zaya_codec PRIVATE -O3 -std=c++26)
 target_link_libraries(zaya_codec PUBLIC gguf_reader)
 
 add_executable(test_zaya_codec tests/test_zaya_codec.cpp)
 target_include_directories(test_zaya_codec PRIVATE include/)
-target_compile_options(test_zaya_codec PRIVATE -O3 -std=c++17)
+target_compile_options(test_zaya_codec PRIVATE -O3 -std=c++26)
 target_link_libraries(test_zaya_codec PRIVATE zaya_codec)
 rocm_hip_target(test_fd_seq3 tests/test_fd_seq3.cpp)
 add_test(NAME test_fd_seq3 COMMAND test_fd_seq3)

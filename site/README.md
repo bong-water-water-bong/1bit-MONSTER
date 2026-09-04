@@ -2,7 +2,7 @@
 
 <sub>**One engine. Any model. Zero Python.**</sub>
 
-A model-agnostic, hardware-agnostic, pure-C++23 inference engine — MIT licensed.
+A model-agnostic, hardware-agnostic, pure-C++26 inference engine — MIT licensed.
 One binary that runs Hugging Face models on **NPU + GPU + CPU**. 16 model families,
 the native **1BP** format, and **JARVIS** (the flagship voice assistant) all inside
 `build/1bit`.
@@ -15,7 +15,7 @@ NPU + GPU + CPU in one engine. Zero Python. MIT.
 ### The lines
 
 - **One engine, any model** — detects the architecture and picks a kernel path. No config, no glue.
-- **Zero Python** — pure C++23. No virtualenv, no pip, nothing to babysit. Source to model in three commands.
+- **Zero Python** — pure C++26. No virtualenv, no pip, nothing to babysit. Source to model in three commands.
 - **The NPU story** — AMD's closed XDNA 2 stack, 22 proprietary libraries, was reverse-engineered in four days. And now it beats it.
 
 ---
@@ -76,6 +76,13 @@ with a 1-bit pixel identity.
 ### Design system
 
 - **Light modern-minimal ground** — near-white background, ink type, hairline structure.
+- **Theme modes** — **light** (default) / **auto** (follows the OS) / **dark**, via the
+  segmented switch in the top nav. Choice persists in `localStorage` (`1bit-theme`);
+  `theme.js` in `<head>` applies it before first paint so there is no flash.
+  Dark mode swaps the oklch tokens per page and pins the intentionally inverted
+  pieces (ink console screens, merch plates) to their light-design values.
+  Regenerate on every page with `python3 scripts/site_theme_modes.py`.
+
 - **1-bit pixel identity** — the relay mark, crisp pixel art, one blue accent + one status green.
 - **Type** — system display sans + system body; mono for numerics, labels, micro-labels.
 

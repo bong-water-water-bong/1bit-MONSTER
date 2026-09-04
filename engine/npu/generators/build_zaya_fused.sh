@@ -28,7 +28,7 @@ M=/home/bcloud/mlir-aie/.venv/lib/python3.14/site-packages/mlir_aie
 PYTHON=/home/bcloud/mlir-aie/.venv/bin/python3
 AIECC=/home/bcloud/mlir-aie/build_tmp/bin/aiecc
 AIETOOLS=/home/bcloud/mlir-aie/build_tmp
-export PATH=/home/bcloud/Xilinx/2026.1/2026.1/Vitis/bin:/opt/xilinx/xrt/bin:$PATH
+export PATH=/home/bcloud/Xilinx/2026.1/Vitis/bin:/opt/xilinx/xrt/bin:$PATH
 export PYTHONPATH=/home/bcloud/mlir-aie/install_tmp/python:/home/bcloud/mlir-aie/.venv/lib/python3.14/site-packages
 export LD_LIBRARY_PATH=/home/bcloud/mlir-aie/install_tmp/python/aie/_mlir_libs
 
@@ -49,8 +49,20 @@ trap 'rm -rf "$workdir"' EXIT
 
 # 1. Compile the DIM_M=8 kernel (1x4 mmul + the fused silu_quant_i8_fused
 #    entry from silu_quant.h — the on-core SiLU+quant step) INTO the workdir.
+# Issue #1874: I4_SCALAR_C1 is the PRODUCTION DEFAULT (mmul C1 store
+# miscompiled for non-uniform B; scalar path verified corr 1.0 via #1897).
+# I4_USE_MMUL=1 reverts to the experimental mmul path.
+I4_SCALAR_FLAGS=(-DI4_SCALAR_C1 -DI4_SCALAR_C1_ACK_1864)
+if [ "${I4_USE_MMUL:-0}" = "1" ]; then
+    I4_SCALAR_FLAGS=()
+    # #1872: the mmul path uses the register-only direct-vector dequant (the
+    # B'' memory round-trip is unsafe on this toolchain). Inject the define.
+    I4_SCALAR_FLAGS+=(-DI4_DIRECT_VECTOR_DEQ)
+fi
 $P/bin/clang++ --target=aie2p-none-unknown-elf --std=c++20 -O2 \
     -DDIM_M=8 -DDIM_K=64 -DDIM_N=128 -Di8_i32_ONLY -DM8_VECTORIZED \
+    "${I4_SCALAR_FLAGS[@]}" \
+    ${NPU_C1_DUMP:+-DNPU_C1_DUMP} ${I4_SUM_A:+-DI4_SUM_A} ${I4_B_DUMP:+-DI4_B_DUMP} ${I4_C1_DUMP:+-DI4_C1_DUMP} ${I4_A_DUMP:+-DI4_A_DUMP} ${I4_REF_DUMP:+-DI4_REF_DUMP} ${I4_C12_DUMP:+-DI4_C12_DUMP} ${I4_B4_DUMP:+-DI4_B4_DUMP} ${I4_NO_ZERO_TAIL:+-DI4_NO_ZERO_TAIL} ${I4_C00_DUMP:+-DI4_C00_DUMP} \
     -isystem $P/include/c++/v1 \
     -I /home/bcloud/Xilinx/2025.2/Vitis/aietools/include \
     -I $M/include/aie_kernels/aie2p \
@@ -63,7 +75,8 @@ echo "═══ fused GU→SiLU→D  M=8 K=2048 N_GU=4096 N_D=2048 ═══"
 
 # int4 GU mode (issue #1769, ws09): NPU_FUSED_I4=1 selects the raw-Q4NX
 # generator (n1_core_fused_gu_silu_d_p1_i4.py) whose B stream is ONE linear
-# 4864-B chunk per (64,128) tile (nibbles 4096 + s 512 + S_col 256) consumed
+# 8192-B chunk per (64,128) tile (nibbles 4096 + ratioQ22 1024 + silu meta
+# 512 + pad 2560 — gu_i4_pack.h TILE_TOTAL, v65) consumed
 # by matmul_i8_i32_i4, plus the per-column fold silu (silu_quant_i8_fused_i4).
 I4=0
 if [ "${NPU_FUSED_I4:-0}" = "1" ]; then I4=1; fi
@@ -207,19 +220,22 @@ for fifo, offset, sizes, strides in ops:
                 errors.append(msg); seen.add(msg)
     elif fifo.startswith("B_S"):  # linear B tiles
         if I4:
-            # int4 (issue #1769 ws09): ONE linear 4864-B chunk per (64,128)
-            # tile = [nibbles 4096][s 512][S_col 256], at (ki*32 + n_tile)*4864
-            if sizes == [1, 1, 1, 4864] and strides == [1, 1, 1, 1]:
+            # int4 (issue #1769 ws09, v65 pack): ONE linear 8192-B chunk per
+            # (64,128) tile = [nibbles 4096][ratioQ22 1024][silu meta 512][pad
+            # 2560] (gu_i4_pack.h TILE_TOTAL), at (ki*32 + n_tile)*8192. The
+            # aie2p object-fifo delivers only [0..5632) of each slot — the
+            # nibble/ratio/meta regions the kernel reads.
+            if sizes == [1, 1, 1, 8192] and strides == [1, 1, 1, 1]:
                 b_ok = True
                 offs = offset if isinstance(offset, list) else [offset]
-                bad = [o for o in offs if o % 4864 != 0]
+                bad = [o for o in offs if o % 8192 != 0]
                 if bad:
                     n_b_off_bad += len(bad)
-                    msg = f"B_S tap offset(s) {bad} not 4864-multiples (expected (ki*32+n_tile)*4864)"
+                    msg = f"B_S tap offset(s) {bad} not 8192-multiples (expected (ki*32+n_tile)*8192)"
                     if msg not in seen:
                         errors.append(msg); seen.add(msg)
             else:
-                msg = f"B_S tap sizes {sizes} strides {strides}, expected linear 4864-byte int4 tile"
+                msg = f"B_S tap sizes {sizes} strides {strides}, expected linear 8192-byte int4 tile"
                 if msg not in seen:
                     errors.append(msg); seen.add(msg)
         else:
@@ -245,18 +261,18 @@ if not a_ok:
     errors.append("no A tap with strides [8K, 8, K, 1]")
 if not b_ok:
     if I4:
-        errors.append("no linear B tile (sizes [1,1,1,4864], strides [1,1,1,1])")
+        errors.append("no linear B tile (sizes [1,1,1,8192], strides [1,1,1,1])")
     else:
         errors.append("no linear B tile (sizes [1,1,1,8192], strides [1,1,1,1])")
 if n_b_off_bad:
-    errors.append(f"{n_b_off_bad} B-tile offset(s) not {'4864' if I4 else '8192'}-multiples")
+    errors.append(f"{n_b_off_bad} B-tile offset(s) not 8192-multiples")
 
 if errors:
     print("fused design verification FAILED:", file=sys.stderr)
     for e in errors:
         print("  - " + e, file=sys.stderr)
     sys.exit(1)
-print(f"fused design verification OK: {len(ops)} DMA bd ops, h2 [8K,K,8,1] + A [8K,8,K,1] + B {'4864' if I4 else '8192'}-step tiles")
+print(f"fused design verification OK: {len(ops)} DMA bd ops, h2 [8K,K,8,1] + A [8K,8,K,1] + B 8192-step tiles")
 PYEOF
 
 xclbin="$XCLBIN_DIR/final_i8_MOE_GUSILU_i4_zaya.xclbin"

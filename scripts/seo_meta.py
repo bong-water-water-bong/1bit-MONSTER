@@ -155,14 +155,21 @@ def json_ld(html: str, name: str) -> str:
 
 
 def inject_json_ld(html: str, name: str) -> str:
-    if "application/ld+json" in html:
-        return html
     ld = json_ld(html, name)
     block = (
         f'  <script type="application/ld+json">\n'
         f'  {ld}\n'
         f"  </script>"
     )
+    if "application/ld+json" in html:
+        # Dates come from origin/main git history, so a page generated before
+        # its file was merged carries empty datePublished/dateModified. Re-inject
+        # (in place) only when a date is still missing — otherwise idempotent.
+        if '"datePublished": ""' not in html:
+            return html
+        return re.sub(
+            r'  <script type="application/ld\+json">.*?</script>',
+            lambda m: block, html, count=1, flags=re.S)  # callable: skips \-escape parsing of the JSON
     return re.sub(r"(</head>)", lambda m: block + "\n" + m.group(1), html, count=1)
 
 
@@ -182,7 +189,7 @@ def gen_sitemap(site_dir: Path) -> None:
     urls = []
     for p in sorted(site_dir.glob("*.html")):
         name = p.name
-        loc = SITE if name == "index.html" else f"{SITE}/{name}"
+        loc = (SITE + "/") if name == "index.html" else f"{SITE}/{name}"  # slash form matches canonical
         lm = git_lastmod(f"site/{name}")
         urls.append((loc, lm, prio.get(name, "0.7"), freq.get(name, "weekly")))
     lines = ["<?xml version=\"1.0\" encoding=\"UTF-8\"?>",

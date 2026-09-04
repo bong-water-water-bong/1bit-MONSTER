@@ -20,6 +20,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cctype>
 #include <cmath>
 #include <fstream>
 #include <vector>
@@ -147,6 +148,34 @@ static bool detect_from_flm_q4nx(const std::string& path, ModelConfig& cfg) {
     if (emb.size() < 2) return false;
     cfg.vocab_size = emb[0];
     cfg.hidden_size = emb[1];
+    // Authoritative dims live in the top-level Q4NX manifest scalars
+    // (hidden_size / vocab_size / num_hidden_layers / num_attention_heads /
+    // num_key_value_heads / head_dim) — the per-tensor "shape" field is the
+    // PACKED tile geometry (e.g. Zaya embed_tokens shape [65568,5120] from
+    // the int8-expanded tiles, NOT the logical [262272,2048]; the shape-derived
+    // values below were misreading zaya as V=65568 H=5120 L=12). Same fix the
+    // engine's parse_q4nx_header applied (ZAYA-CCA-CPU-PORT session 1): the
+    // top-level scalars win when present; the shape-derived values below are
+    // the fallback for FLM-style manifests that carry no scalar fields.
+    auto top_int = [&](const char* field, int dflt) -> int {
+        size_t fl = strlen(field);
+        size_t pos = 0;
+        while (pos < n) {
+            auto q = head.find(field, pos);
+            if (q == std::string::npos) return dflt;
+            if ((q == 0 || head[q - 1] == '"') && q + fl < n && head[q + fl] == '"') {
+                auto colon = head.find(':', q + fl);
+                if (colon != std::string::npos) {
+                    auto start = colon + 1;
+                    while (start < n && (head[start] == ' ' || head[start] == '\t')) start++;
+                    if (start < n && (head[start] == '-' || isdigit((unsigned char)head[start])))
+                        return atoi(head.c_str() + start);
+                }
+            }
+            pos = q + fl;
+        }
+        return dflt;
+    };
     // layer count from the max model.layers.N index
     // Qwen3.6-35B-A3B q4nx uses SINGULAR "model.layer.N." — try both.
     int max_l = -1;
@@ -164,6 +193,13 @@ static bool detect_from_flm_q4nx(const std::string& path, ModelConfig& cfg) {
     auto kp = parse_shape("model.layers.0.self_attn.k_proj.weight");
     if (qp.size() >= 2 && qp[1] > 0) { cfg.num_heads = qp[1] / 128; cfg.head_dim = 128; }
     if (kp.size() >= 2 && kp[1] > 0) cfg.num_kv_heads = kp[1] / 128;
+    // Top-level scalars override the shape-derived guesses (authoritative).
+    if (top_int("hidden_size", -1) > 0) cfg.hidden_size = top_int("hidden_size", cfg.hidden_size);
+    if (top_int("vocab_size", -1) > 0) cfg.vocab_size = top_int("vocab_size", cfg.vocab_size);
+    if (top_int("num_hidden_layers", -1) > 0) cfg.num_layers = top_int("num_hidden_layers", cfg.num_layers);
+    if (top_int("num_attention_heads", -1) > 0) cfg.num_heads = top_int("num_attention_heads", cfg.num_heads);
+    if (top_int("num_key_value_heads", -1) > 0) cfg.num_kv_heads = top_int("num_key_value_heads", cfg.num_kv_heads);
+    if (top_int("head_dim", -1) > 0) cfg.head_dim = top_int("head_dim", cfg.head_dim);
     cfg.format = ModelFormat::Q4NX;
     auto slash = path.find_last_of('/');
     auto dot = path.find_last_of('.');
@@ -274,6 +310,33 @@ static bool detect_from_manifest(const std::string& path, ModelConfig& cfg) {
         if (cfg.weights_dir.empty()) {
             const char* home = getenv("HOME");
             cfg.weights_dir = (home && home[0]) ? std::string(home) + "/.local/share/1bit-monster/weights/" : "/tmp/zaya_weights/";
+        }
+        // Issue #1832: set the format so the router can prefer the Q4NX NPU
+        // backend. Accept an explicit "format" field ("q4nx"/"gguf"/"h1b"/
+        // "onebp") OR derive it from the model_path extension — a manifest
+        // that leaves format UNKNOWN makes every format-aware backend
+        // (NPU universal, FLM) reject the model and it falls into the GGUF
+        // loader, which was the original bug. Mirrors the .1bp path
+        // (detect_from_1bp sets Q4NX/ONEBP from the extension).
+        {
+            std::string fmt = j.value("format", std::string());
+            std::string mp = cfg.model_path;
+            if (!fmt.empty()) {
+                std::string f = fmt;
+                for (auto& c : f) c = (char)tolower(c);
+                if (f == "q4nx") cfg.format = ModelFormat::Q4NX;
+                else if (f == "gguf") cfg.format = ModelFormat::GGUF;
+                else if (f == "h1b") cfg.format = ModelFormat::H1B;
+                else if (f == "onebp" || f == "1bp") cfg.format = ModelFormat::ONEBP;
+                else if (f == "safetensors") cfg.format = ModelFormat::SAFETENSORS;
+            } else if (mp.size() > 5 &&
+                       mp.substr(mp.size() - 5) == ".q4nx") {
+                cfg.format = ModelFormat::Q4NX;
+            } else if (mp.size() > 5 &&
+                       mp.substr(mp.size() - 5) == ".gguf") {
+                cfg.format = ModelFormat::GGUF;
+            }
+            fprintf(stderr, "  Manifest format: %d (%s)\n", (int)cfg.format, cfg.model_path.c_str());
         }
         fprintf(stderr, "  Loaded manifest: %s\n", cfg.model_name.c_str());
         fprintf(stderr, "    hidden=%d layers=%d heads=%d vocab=%d\n",
@@ -872,7 +935,7 @@ int main(int argc, char** argv) {
             lemon::RuntimeConfig::set_global(config.get());
             lemon::configure_application_logging(config->log_level(),
                                                  lemon::LoggingMode::direct_server);
-            lemon::Server server(config, cli_config.cache_dir);
+            lemon::Server server(config, cli_config.cache_dir, cli_config.config_dir);
             server.run();
             return 0;
         }

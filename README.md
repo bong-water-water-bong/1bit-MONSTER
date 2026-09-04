@@ -5,21 +5,24 @@
 [![CI](https://github.com/1bit-MONSTER/1bit-MONSTER/actions/workflows/ci.yml/badge.svg)](https://github.com/1bit-MONSTER/1bit-MONSTER/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-**[Website](https://1bit.monster)** · **[Docs](docs/README.md)** · **[Benchmarks](docs/wiki/performance.md)** · **[The story](docs/journey.md)** · **[Roadmap](docs/guides/roadmap.md)**
+**[Website](https://1bit.monster)** · **[Community (Fluxer)](https://fluxer.gg/7wqCREKi)** · **[Join Discord](https://discord.gg/Qy38d4Xu2h)** · **[Docs](docs/README.md)** · **[Model families](docs/model-families/README.md)** · **[Benchmarks](docs/wiki/performance.md)** · **[JARVIS](docs/jarvis.md)** · **[The story](docs/journey.md)** · **[Roadmap](docs/guides/roadmap.md)**
 
-pure C++23 · no Python · MIT
+pure C++26 · zero Python at runtime · MIT
 
 </div>
 
 ---
 
-## Why this exists
+**One engine. Any model. Zero Python.**
 
-**AMD's XDNA 2 NPU shipped closed.** 22 proprietary `.so` files, 209 xclbin bitstreams, zero public documentation. One person reverse-engineered the entire stack in four days — no docs, just a disassembler, `strace`/`ftrace`, and a C++ compiler — and kept building from there. Every crash and breakthrough since is logged in the open, ~600 hours in. **[Read the story →](docs/journey.md)**
+A model-agnostic, hardware-agnostic inference engine in a single C++26 binary. Point it at a model file — GGUF, 1BP, ONNX, H1B, safetensors — and it auto-detects the architecture and runs on whatever hardware you have: AMD XDNA 2 NPU, GPU (HIP, CUDA, Metal, Vulkan), or CPU. No config files, no per-model glue, no Python interpreter anywhere.
 
-**One engine. Every model.** 100% of HuggingFace's architecture-bearing text-generation checkpoints (317,310 of them) map to a token this engine knows how to run — Llama, Qwen, DeepSeek, GLM, Mamba/SSM, MoE, vision, ternary/1-bit, all of it. Reads GGUF, ONNX, and native 1BP. Same binary, no config file, on NPU, GPU, or CPU. **[Model families →](docs/model-families/README.md)**
+## What you get
 
-**JARVIS, out of the box.** A fully local voice assistant ships with the engine, not bolted on: mic → VAD → STT → LLM → TTS → speaker, one process, pure C++, zero cloud calls. `./build/1bit jarvis` and it's listening. **[JARVIS docs →](docs/jarvis.md)**
+- **One binary** — `build/1bit` is busybox-style: every server and CLI in a single ELF, dispatched by subcommand (`1bit zaya`, `unified`, `router`, `jarvis`, `vision`, …).
+- **Any model** — 552 architecture tokens mapping 1,774 HuggingFace arch strings; 317,310 / 317,310 text-generation checkpoints on the hub (100%) land on an engine token.
+- **Any hardware** — NPU (XDNA 2, reverse-engineered in 4 days — [the story](docs/journey.md)), GPU (HIP, CUDA, Metal, Vulkan), CPU (AVX-512/scalar). Auto-routed per model.
+- **Zero Python** — pure C++26 at runtime. No virtualenv, no interpreter, no runtime stack to babysit.
 
 ## Quick start
 
@@ -29,40 +32,23 @@ cd 1bit-MONSTER && cmake -B build && cmake --build build
 ./build/1bit zaya -m model.1bp -p "Hello world"
 ```
 
-That's the whole install. No runtime, no virtualenv, no Python.
+That's the whole install. Full build guide: [docs/guides/building.md](docs/guides/building.md).
 
-## What it is
+## Model families
 
-An **inference engine** — the thing that actually runs the model. Not a chat app; bring your own frontend.
+1bit auto-detects [16+ model families](docs/model-families/README.md) with zero per-model code — Zyphra (Zaya, Zamba2, BlackMamba), Qwen, Llama, Mistral, Gemma, Phi, Falcon, OLMo, Granite, SmolLM, DeepSeek, GPT-OSS, Laguna, Kimi, BitNet/Bonsai, Whisper. The [Zyphra family](docs/model-families/zyphra.md) is the flagship: a full stack from EEG → LLM → TTS on one binary.
 
-- **Model agnostic.** Reads GGUF, ONNX, and native 1BP. Detects the architecture, picks a kernel path. No config files.
-- **Hardware agnostic.** Same binary, same command, on any silicon: AMD Strix Halo NPU + GPU, NVIDIA (CUDA — [needs testers](https://github.com/1bit-MONSTER/1bit-MONSTER/issues/1703)), Apple Silicon, any Vulkan 1.2+ GPU, x86 CPU. No rebuild to move a model ([architecture](docs/guides/architecture.md)).
-- **One binary, every server.** `build/1bit` holds the CLI and all servers, dispatched by subcommand (`zaya`, `unified`, `jarvis`, `vision`, `chat`, …). OpenAI-compatible `POST /v1/chat/completions`, speculative decoding, image/video/voice generation.
+Also in the box: **JARVIS** — a fully-local voice pipeline (mic → STT → LLM → TTS → speaker) that proves the engine end-to-end ([docs/jarvis.md](docs/jarvis.md)).
 
-## Benchmarks
+## Docs
 
-Headline end-to-end decode on an AMD Ryzen AI MAX+ 395 (Radeon 8060S, 32 GB UMA):
+- [Docs index](docs/README.md) · [Getting started](docs/guides/getting-started.md) · [Architecture](docs/guides/architecture.md) · [Benchmarks](docs/wiki/performance.md) · [Lemonade compat](docs/guides/Lemonade-Compat.md) · [The Mesh](docs/mesh-protocol.md) · [Roadmap](docs/guides/roadmap.md)
 
-| Model | Gen tok/s (e2e) | Backend |
-|-------|:---------------:|---------|
-| SmolLM2-135M | **662** | GGML-Vulkan |
-| Qwen3-0.6B | **373** | GGML-Vulkan |
-| BlackMamba-1.5B | **79.4** | Mamba1 HIP |
-| BlackMamba-2.8B | **46.0** | Mamba1 HIP |
-| DeepSeek-R1-Distill-Llama-8B | **44** | GGML-Vulkan |
-| ZAYA1-74B-preview | **17.6** | GGML-Vulkan |
+## Community
 
-Plus **38.84 TFLOPS** INT8 prefill. Measured, not projected — full numbers and methodology: **[docs/wiki/performance.md](docs/wiki/performance.md)**.
-
-## Also in the box
-
-- **The Mesh** — installs self-discover on the LAN and federate: shared routing, model exchange, load sharing. Zero config. ([docs/mesh-protocol.md](docs/mesh-protocol.md))
-
-## Learn more
-
-- **[Documentation index](docs/README.md)** · **[Getting started](docs/guides/getting-started.md)** · **[Build guide](docs/guides/building.md)**
-- **[Model families](docs/model-families/README.md)** · **[Benchmarks](docs/wiki/performance.md)** · **[Roadmap](docs/guides/roadmap.md)**
-- **[The engineering journey](docs/journey.md)** · **[Contributing](CONTRIBUTING.md)**
+- **Discord** → https://discord.gg/Qy38d4Xu2h
+- **Fluxer** (official support) → https://fluxer.gg/7wqCREKi
+- **Issues & feature requests** → https://github.com/1bit-MONSTER/1bit-MONSTER/issues
 
 ## License
 

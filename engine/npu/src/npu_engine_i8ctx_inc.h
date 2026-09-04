@@ -40,6 +40,16 @@ void gemm_generate_sequence_i8(
 
 struct I8Ctx {
     int MD, KD, ND, NL;
+    int bC_nd = 0;   // bo2 (C2) size override: MD*bC_nd*4 bytes when > 0.
+    bool bf16_pair = false;  // #1934: kernel B dequant mode. true = the
+                             // I4_BF16_PAIR bf16-(a,b) q4*a+b dequant; false
+                             // = v66 ratioQ22. MUST match the xclbin the ctx
+                             // was built with so packB_into_fused_i4 packs
+                             // the same B'' layout the kernel dequants.
+                     // The int4 P1 launch writes the FULL C1 (32 chunks x
+                     // 4 KB = 128 KB) to bo2 (issue #1769 CPU-silu fallback),
+                     // while ND is the logical D output width (2048) — set
+                     // bC_nd = 2*n_ff (4096) so the writeback fits.
     std::unique_ptr<xrt::xclbin> xc;
     std::unique_ptr<xrt::hw_context> hc;
     std::unique_ptr<xrt::kernel> k;
@@ -201,8 +211,9 @@ struct I8Ctx {
         fprintf(stderr, "  creating bA size=%zu (MD=%d KD=%d)\n", (size_t)MD * KD, MD, KD);
         bA = std::make_unique<xrt::bo>(d, (size_t)MD * KD,
                                        XRT_BO_FLAGS_HOST_ONLY, grp_a);
-        fprintf(stderr, "  creating bC size=%zu (MD=%d ND=%d)\n", (size_t)MD * ND * 4, MD, ND);
-        bC = std::make_unique<xrt::bo>(d, (size_t)MD * ND * 4,
+        size_t bc_bytes = bC_nd > 0 ? (size_t)MD * bC_nd * 4 : (size_t)MD * ND * 4;
+        fprintf(stderr, "  creating bC size=%zu (MD=%d ND=%d bC_nd=%d)\n", bc_bytes, MD, ND, bC_nd);
+        bC = std::make_unique<xrt::bo>(d, bc_bytes,
                                        XRT_BO_FLAGS_HOST_ONLY, grp_c);
         Am = (int8_t*)bA->map();
         Cm = (int32_t*)bC->map();
@@ -776,7 +787,7 @@ struct I8Ctx {
     void packB_into_fused_i4(xrt::bo& bo, const RawQ4Tensor& raw, int expert,
                              int H, int n_ff, std::vector<float>& col_out,
                              std::vector<int8_t>& row_out) {
-        auto pack = pack_gu_fused_i4(raw, expert, H, n_ff);
+        auto pack = pack_gu_fused_i4(raw, expert, H, n_ff, bf16_pair);
         uint8_t* Bm = (uint8_t*)bo.map();
         write_gu_i4_bo(Bm, pack);
         // gs-header region: the int4 path's SiLU uses the per-token folded

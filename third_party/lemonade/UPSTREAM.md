@@ -1,18 +1,40 @@
-# Vendored: lemonade-sdk/lemonade (embedded server core)
+# Vendored: lemonade (LOCAL-ONLY source)
 
-Vendored from https://github.com/lemonade-sdk/lemonade at commit
-`2b6a7d77c71e551736f6cc8473dc46f479cd156b` (tag `v11.7.0`).
+> **LOCAL-ONLY.** Refresh this vendored tree from the **local** lemonade source
+> (`/home/bcloud/1bit-lemonade-v1170/third_party/lemonade`), never from
+> `github.com/lemonade-sdk/lemonade` (see that worktree's `RULES.md`). Do NOT
+> `git fetch` / `pull` / `clone`, push PRs, open issues, or run CI against
+> upstream.
 
-Vendored (instead of a submodule) because the embedded server core needs a
-patch that only exists locally, and CI can't fetch unpublished submodule
-SHAs. Re-vendor on upstream sync:
+This snapshot is at **lemonade v11.9.0**.
+
+## What is upstream vs local
+
+As of v11.9.0, **upstream now carries the `llamacpp-hrx` backend itself**
+(`src/cpp/server/backends/hrx/hrx_server.cpp` + `lemon/backends/hrx/`), so that
+part of our HRX work is no longer a local patch — the HRX backend code is
+byte-identical to upstream.
+
+The **local-only** deltas carried on top of v11.9.0 are:
+
+1. **`hrx-b66` pin** (newer than upstream's `hrx-b59`): in
+   `src/cpp/resources/backend_versions.json` and `test/cpp/test_hrx_contract.cpp`.
+2. **HRX model-registry annotations**: `src/cpp/resources/server_models.json`
+   carries the `*-HRX` entries (`hrx_serve` / `hrx_token_embd` / `hrx_embd_w`),
+   `tools/gen_hrx_model_entries.py` and `tools/annotate_hrx_embedding_quants.py`
+   are local-only (upstream does not read or generate these).
+3. **Embeddability patch** in `CMakeLists.txt` (see below).
+
+> Note: the `stream_stall_timeout` config key that our v11.8.x snapshot carried
+> was **dropped** in this re-vendor — v11.9.0 handles the streaming-stall bound
+> via `global_timeout` (upstream #3386), and local review confirmed the extra
+> config key is not needed.
 
 ```sh
-git clone https://github.com/lemonade-sdk/lemonade /tmp/lemonade
-cd /tmp/lemonade
-git checkout 2b6a7d77c71e551736f6cc8473dc46f479cd156b  # v11.7.0
+# Re-vendor FROM the local source:
+rsync -a --exclude=.git --exclude=UPSTREAM.md \
+  /home/bcloud/1bit-lemonade-v1170/third_party/lemonade/ third_party/lemonade/
 # re-apply the embeddability patch below
-rsync -a --exclude=.git /tmp/lemonade/ third_party/lemonade/
 ```
 
 ## Local patch: embeddability
@@ -33,5 +55,10 @@ rsync -a --exclude=.git /tmp/lemonade/ third_party/lemonade/
    (`unified_server`, `unified_router`) linking the OBJECT library see
    `lemon/` headers + generated headers (upstream uses a subdirectory-local
    `include_directories()` that does not propagate to consumers).
+4. `add_test()` police guarded by `BUILD_TESTING` so it does not leak into
+   the parent scope when embedded via `add_subdirectory()`.
+5. `add_dependencies(lemonade-server-core copy_resources)` so the resource
+   copy fires even though `lemond` (whose POST_BUILD would trigger it) is
+   never built in the embed.
 
 Drop the patch when upstream adopts any of these changes.

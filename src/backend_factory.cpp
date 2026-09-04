@@ -163,6 +163,35 @@ static Backend* try_create_vart() {
     return b;
 }
 
+// LSE (Lemon Seed Engine) is a text-level subprocess backend: the factory
+// symbol is always present in the unified server build, and availability is
+// decided at init() by whether an lse-server binary can be spawned (env
+// LSE_SERVER_BIN / PATH). No compile-time dependency on ROCm/HRX.
+static Backend* try_create_lse() {
+    if (has_static_symbol("create_lse_backend")) {
+        void* h = dlopen(nullptr, RTLD_LAZY);
+        if (h) {
+            auto* fn = (Backend*(*)())dlsym(h, "create_lse_backend");
+            if (fn) return fn();
+        }
+    }
+    return nullptr;
+}
+
+// HRX GPU backend — subprocess HRX llama-server (fused GGUF lane). Availability
+// decided at init() by whether the HRX llama-server can spawn (HRX_ROOT /
+// HRX_MODEL_BIN / PATH). No compile-time dependency on ROCm/HRX.
+static Backend* try_create_hrx() {
+    if (has_static_symbol("create_hrx_backend")) {
+        void* h = dlopen(nullptr, RTLD_LAZY);
+        if (h) {
+            auto* fn = (Backend*(*)())dlsym(h, "create_hrx_backend");
+            if (fn) return fn();
+        }
+    }
+    return nullptr;
+}
+
 // ── Mamba1 detection ──
 bool is_mamba1_architecture(const ModelConfig& cfg) {
     return cfg.arch == RCPP_ARCH_MAMBA || cfg.arch == RCPP_ARCH_ZAMBA;
@@ -174,51 +203,34 @@ bool is_zamba2_architecture(const ModelConfig& cfg) {
 
 // ── Auto-detect available backends ──
 bool has_hip_gpu() {
+    // A HIP-capable GPU is present only when an AMD render node exists.
     // Check lightweight indicators first — avoid dlopen("librocm_cpp.so")
     // which triggers HSA runtime init that opens /dev/accel/accel0 on
     // Strix Halo, preventing standalone NPU tools from accessing the device
     // even when the GPU backend isn't actively inferring. See issue #1029.
+    //
+    // NOTE: in the monolithic onebin build the HIP backend is always a
+    // static symbol (and librocm_cpp.so is always installed), so a
+    // symbol/library check alone would report a GPU on machines that have
+    // none — causing the HIP backend to be created and abort() on
+    // hipErrorNoDevice (found via the appliance ISO's QEMU boot test).
+    // Hardware presence is the render node; require it.
     struct stat st;
     if (stat("/dev/dri/renderD128", &st) == 0) return true;
     if (stat("/dev/dri/renderD129", &st) == 0) return true;
     if (stat("/dev/dri/renderD130", &st) == 0) return true;
-    if (has_static_symbol("create_hip_backend")) return true;
-    // Last resort: probe the shared library (will trigger HSA init)
-    void* lib = dlopen("librocm_cpp.so", RTLD_NOW | RTLD_LOCAL);
-    if (lib) { dlclose(lib); return true; }
     return false;
 }
 
 bool has_vulkan() {
-    // Check lightweight indicators first — avoid dlopen("librocm_cpp.so")
-    // which triggers HSA runtime init on Strix Halo. See issue #1029.
-    // 1. Static symbol check (fast, no library load)
-    if (has_static_symbol("create_vulkan_backend")) return true;
-
-    // 2. Check render nodes first — fast stat() call, no library load.
-    //    On systems with a GPU (Strix Halo, dGPU), this succeeds instantly.
+    // Same principle as has_hip_gpu(): a usable Vulkan device requires a
+    // render node. dlopen("libvulkan.so") succeeding only proves the loader
+    // is installed, not that any physical device exists — on GPU-less boxes
+    // (VMs, headless Intel) that false positive made the probe select a
+    // Vulkan backend whose init then failed at runtime.
     struct stat st;
     if (stat("/dev/dri/renderD128", &st) == 0) return true;
     if (stat("/dev/dri/renderD129", &st) == 0) return true;
-
-    // 3. Probe via libvulkan — lightweight symbol check only.
-    //    dlopen("libvulkan.so") can hang on some systems if the Vulkan
-    //    loader tries to initialize GPU drivers, so only do this if
-    //    render nodes weren't found (headless/VM fallback).
-    void* lib = dlopen("libvulkan.so.1", RTLD_LAZY);
-    if (!lib) lib = dlopen("libvulkan.so", RTLD_LAZY);
-    if (lib) {
-        bool has_syms =
-            dlsym(lib, "vkCreateInstance") &&
-            dlsym(lib, "vkEnumeratePhysicalDevices") &&
-            dlsym(lib, "vkDestroyInstance");
-        dlclose(lib);
-        if (has_syms) return true;
-    }
-
-    // 4. Last resort: probe the full shared library (will trigger HSA init)
-    lib = dlopen("librocm_cpp.so", RTLD_NOW | RTLD_LOCAL);
-    if (lib) { dlclose(lib); return true; }
     return false;
 }
 
@@ -420,6 +432,18 @@ Backend* create_backend(BackendType type) {
             }
             if (b) { printf("  Created ONNX NPU backend\n"); return b; }
             printf("  ONNX NPU backend unavailable (need ONNX Runtime)\n");
+            return nullptr;
+        }
+        case BackendType::LSE_GPU: {
+            auto* b = try_create_lse();
+            if (b) { printf("  Created LSE backend (MLX via lse-server)\n"); return b; }
+            printf("  LSE backend unavailable (no create_lse_backend symbol)\n");
+            return nullptr;
+        }
+        case BackendType::HRX_GPU: {
+            auto* b = try_create_hrx();
+            if (b) { printf("  Created HRX backend (fused GGUF via hrx llama-server)\n"); return b; }
+            printf("  HRX backend unavailable (no create_hrx_backend symbol)\n");
             return nullptr;
         }
         case BackendType::CPU_AVX512:

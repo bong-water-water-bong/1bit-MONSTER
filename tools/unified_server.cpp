@@ -693,6 +693,28 @@ static json generate_completion(BackendManager& mgr,
     // FLM tokenizes internally, so the token loop below can't drive it.
     // The strategy engine already selected the initial backend above.
     if (!raw_prompt.empty()) {
+        // G1b — large-prefill policy: HRX fail-closes once the decode graph
+        // needs a GET_ROWS (measured ≥~1815 prompt tokens at n_batch=2048).
+        // For prompts over HRX_MAX_PREFILL_TOKENS, skip HRX and start on the
+        // next lane in the model route (ggml_vulkan) — HRX would fail on the
+        // first decode batch anyway, so skip the guaranteed-failed round trip.
+        // 0 disables the policy.
+        const char* hmax_env = getenv("HRX_MAX_PREFILL_TOKENS");
+        long hrx_max_prefill = hmax_env ? atol(hmax_env) : 2048;
+        if (hrx_max_prefill > 0 && (long)prompt_tokens.size() > hrx_max_prefill) {
+            const BackendInfo* ai = mgr.active_info();
+            if (ai && ai->id == "hrx_gpu") {
+                for (const auto& bid : mgr.fallback_order()) {
+                    if (bid == "hrx_gpu") continue;
+                    std::lock_guard<std::mutex> cfg_lock(g_config_mutex);
+                    if (mgr.select_backend(bid)) {
+                        fprintf(stderr, "[hrx] prompt %zu tok > HRX_MAX_PREFILL_TOKENS (%ld) — starting on %s\n",
+                                prompt_tokens.size(), hrx_max_prefill, bid.c_str());
+                        break;
+                    }
+                }
+            }
+        }
         auto* active = mgr.active_backend();
         if (active) {
             // Multi-turn KV reuse: when this request continues the live
@@ -712,7 +734,9 @@ static json generate_completion(BackendManager& mgr,
                 if (text.empty()) cont = false;  // continuation failed → full reset retry
             }
             if (!cont) {
-                text = active->generate_text(raw_prompt, max_tokens);
+                // Manager-level text generation: cascades to the next backend in
+                // the route on failure (e.g. HRX GET_ROWS fail-closed → ggml_vulkan).
+                text = mgr.generate_text(raw_prompt, max_tokens);
                 if (!text.empty()) {  // only record the baseline on success
                     std::lock_guard<std::mutex> lock(g_flm_session_mutex);
                     g_flm_session_id = session_id;
@@ -940,32 +964,43 @@ static json generate_completion(BackendManager& mgr,
         }
 
         if (next < 0) {
-            // Backend failed — try fallback with generate()
+            // Backend failed — try fallback with generate(). Skip the backend
+            // that just failed so a functional-but-incompatible backend (e.g.
+            // a text-level HRX that can't run the token loop, or a graph that
+            // fails at decode) doesn't get retried forever; land on the next
+            // real backend in MODEL ROUTE order (GGUF: hrx_gpu → ggml_vulkan →
+            // zinc_gpu → cpu_generic) via fallback_order() — not on whatever
+            // backend discovery happened to register next, which for a GGUF
+            // model could be an NPU lane that loads the wrong model (G1a).
+            std::string failed_id = active_backend_id;
             if (mgr.backends().size() > 1) {
-                for (auto& b : mgr.backends()) {
-                    if (b.available && b.functional && b.instance) {
-                        mgr.select_backend(b.id);
-                        active_backend_id = b.id;
-                        next = mgr.generate(last_token);
-                        if (next >= 0) {
-                            // Compute actual logprob for cascade/adaptive strategy
-                            std::vector<float> hb(hs);
-                            std::vector<float> lb(vs);
-                            if (need_logprobs && mgr.forward(next, hb.data())) {
-                                int argmax;
-                                if (mgr.lm_head(hb.data(), lb.data(), &argmax)) {
-                                    float max_l = -1e30f;
-                                    for (int v = 0; v < vs; v++) if (lb[v] > max_l) max_l = lb[v];
-                                    double sum_exp = 0.0;
-                                    for (int v = 0; v < vs; v++) sum_exp += exp((double)(lb[v] - max_l));
-                                    if (sum_exp > 0 && next >= 0 && next < vs)
-                                        token_logprob = (double)(lb[next] - max_l) - log(sum_exp);
-                                }
-                            } else {
-                                token_logprob = -10.0;  // uncertain
+                for (const auto& bid : mgr.fallback_order()) {
+                    if (bid == failed_id) continue;
+                    const BackendInfo* cand = nullptr;
+                    for (const auto& b : mgr.backends())
+                        if (b.id == bid && b.available && b.functional && b.instance) { cand = &b; break; }
+                    if (!cand) continue;
+                    mgr.select_backend(cand->id);
+                    active_backend_id = cand->id;
+                    next = mgr.generate(last_token);
+                    if (next >= 0) {
+                        // Compute actual logprob for cascade/adaptive strategy
+                        std::vector<float> hb(hs);
+                        std::vector<float> lb(vs);
+                        if (need_logprobs && mgr.forward(next, hb.data())) {
+                            int argmax;
+                            if (mgr.lm_head(hb.data(), lb.data(), &argmax)) {
+                                float max_l = -1e30f;
+                                for (int v = 0; v < vs; v++) if (lb[v] > max_l) max_l = lb[v];
+                                double sum_exp = 0.0;
+                                for (int v = 0; v < vs; v++) sum_exp += exp((double)(lb[v] - max_l));
+                                if (sum_exp > 0 && next >= 0 && next < vs)
+                                    token_logprob = (double)(lb[next] - max_l) - log(sum_exp);
                             }
-                            break;
+                        } else {
+                            token_logprob = -10.0;  // uncertain
                         }
+                        break;
                     }
                 }
             }
@@ -1159,7 +1194,7 @@ static int run_embedded_lemonade(int argc, char** argv) {
     lemon::configure_application_logging(config->log_level(),
                                          lemon::LoggingMode::direct_server);
 
-    lemon::Server server(config, cli_config.cache_dir);
+    lemon::Server server(config, cli_config.cache_dir, cli_config.config_dir);
     server.run();
     return 0;
 }
@@ -1243,7 +1278,7 @@ int main(int argc, char** argv) {
     };
 
     bool quick_mode = false;
-    bool free_npu = false; (void)free_npu;
+    bool free_npu = false;
     std::string g_cors_origin;
     std::string g_model_name;
     int opt;
@@ -1387,7 +1422,35 @@ int main(int argc, char** argv) {
     static ModelConfig current_cfg = default_model_config();
     if (!g_model_name.empty()) {
         std::string user_name = normalize(g_model_name);
+        // 0. Direct file path (issue #1958): an absolute/relative path or a
+        //    bare "*.gguf"-style argument is a FILE, not a registry name —
+        //    honor it directly. Registry names come from each GGUF's
+        //    general.name metadata, so a path would otherwise match nothing
+        //    and the server would silently fall back to a DIFFERENT model.
+        auto ends_with = [](const std::string& s, const char* suf) {
+            size_t n = std::strlen(suf);
+            return s.size() >= n && s.compare(s.size() - n, n, suf) == 0;
+        };
+        bool looks_like_path = g_model_name.find('/') != std::string::npos ||
+                               g_model_name.find('\\') != std::string::npos ||
+                               ends_with(g_model_name, ".gguf") ||
+                               ends_with(g_model_name, ".q4nx") ||
+                               ends_with(g_model_name, ".h1b") ||
+                               ends_with(g_model_name, ".1bp") ||
+                               ends_with(g_model_name, ".safetensors");
+        if (looks_like_path || std::filesystem::exists(g_model_name)) {
+            ModelConfig file_cfg;
+            if (read_model_file_metadata(g_model_name, file_cfg)) {
+                printf("  (matched \"%s\" as a model file → \"%s\")\n",
+                       g_model_name.c_str(), file_cfg.model_name.c_str());
+                current_cfg = file_cfg;
+            } else {
+                fprintf(stderr, "  ** Model file '%s' exists but is not a supported model format.\n",
+                        g_model_name.c_str());
+            }
+        }
         // 1. Exact match (case-sensitive)
+        if (current_cfg.model_path.empty()) {
         for (auto& m : discovered) {
             if (normalize(m.model_name) == user_name) {
                 printf("  (matched \"%s\" via exact → \"%s\")\n",
@@ -1395,6 +1458,7 @@ int main(int argc, char** argv) {
                 current_cfg = m;
                 break;
             }
+        }
         }
         // 2. Case-insensitive match
         if (current_cfg.model_path.empty()) {
@@ -1451,8 +1515,13 @@ int main(int argc, char** argv) {
             }
         }
         if (current_cfg.model_path.empty()) {
-            printf("  ** Model '%s' not found -- using first available.\n",
-                   g_model_name.c_str());
+            // Issue #1958: never silently serve a DIFFERENT model than the
+            // one requested. If -m was given but resolved to nothing, fail
+            // loudly instead of falling back to discovered.front().
+            fprintf(stderr, "  ** ERROR: model '%s' not found in the registry and not a readable model file.\n",
+                    g_model_name.c_str());
+            fprintf(stderr, "     Pass a registry name (GGUF general.name) or an existing model file path.\n");
+            return 1;
         }
     }
     if (current_cfg.model_path.empty() && !discovered.empty()) {
@@ -1535,14 +1604,23 @@ int main(int argc, char** argv) {
                active ? active->id.c_str() : "?",
                active ? active->description.c_str() : "?");
 #ifndef _WIN32
-        // Release /dev/accel/accel0 if the NPU backend is not active.
-        // The HSA runtime opens this device during GPU backend init (even
-        // for non-NPU backends like Mamba1) as a side effect of accelerator
-        // enumeration on Strix Halo. When the NPU isn't being used, close
-        // any spurious fds so standalone tools (npu_engine_universal) can
-        // access the NPU. The GPU backends don't need it for compute.
-        // See issue #1029.
-        if (!active || active->type != BackendType::NPU_XRT) {
+        // Release /dev/accel/accel0 if the active backend doesn't use the
+        // NPU.  The HSA runtime opens this device during GPU backend init
+        // (even for non-NPU backends like Mamba1) as a side effect of
+        // accelerator enumeration on Strix Halo.  When the NPU isn't being
+        // used, close any spurious fds so standalone tools
+        // (npu_engine_universal) can access the NPU.
+        //
+        // NOTE: the fused backend (fused_gpu_npu) is typed HIP_GPU but holds
+        // its OWN NPU device (xrt::device(0)) + SharedBO + GEMM BOs.  The old
+        // gate (type != NPU_XRT) released the NPU out from under it — closing
+        // its fds and munmap'ing its live mappings caused a use-after-unmap
+        // SIGSEGV whenever fused was the active backend (2026-08-29: server
+        // crashed with fused active; hip_1bp — which never touches the NPU —
+        // was clean).  See issue #1029.
+        bool active_uses_npu = active &&
+            (active->type == BackendType::NPU_XRT || active->id == "fused_gpu_npu");
+        if (!active_uses_npu) {
             // Step 1: Close any open /dev/accel/accel* file descriptors.
             // These are opened by the HSA runtime during GPU backend init
             // as a side effect of accelerator enumeration on Strix Halo.
@@ -1580,29 +1658,31 @@ int main(int argc, char** argv) {
             // "in use" while any process has it mmap'd. Force-unmap those
             // regions so the device is truly free for standalone tools.
             // See issue #1029.
-            FILE* maps = fopen("/proc/self/maps", "r");
-            if (maps) {
-                char line[512];
-                while (fgets(line, sizeof(line), maps)) {
-                    // Parse: "7c2f74000000-7c2f78000000 rw-s ... /dev/accel/accel0"
-                    unsigned long start = 0, end = 0;
-                    char perms[8] = {0}, path[256] = {0};
-                    if (sscanf(line, "%lx-%lx %7s %*s %*s %*s %255s",
-                               &start, &end, perms, path) >= 3) {
-                        if (strstr(path, "/dev/accel/accel") == path) {
-                            size_t len = end - start;
-                            if (munmap((void*)start, len) == 0) {
-                                n_closed++;
-                                printf("  ✓  Unmapped NPU region 0x%lx-0x%lx (%zu MB) — device %s freed\n",
-                                       start, end, len / (1024*1024), path);
-                            } else {
-                                fprintf(stderr, "  ⚠  munmap of 0x%lx failed: %s\n",
-                                        start, strerror(errno));
+            if (free_npu) {
+                FILE* maps = fopen("/proc/self/maps", "r");
+                if (maps) {
+                    char line[512];
+                    while (fgets(line, sizeof(line), maps)) {
+                        // Parse: "7c2f74000000-7c2f78000000 rw-s ... /dev/accel/accel0"
+                        unsigned long start = 0, end = 0;
+                        char perms[8] = {0}, path[256] = {0};
+                        if (sscanf(line, "%lx-%lx %7s %*s %*s %*s %255s",
+                                   &start, &end, perms, path) >= 3) {
+                            if (strstr(path, "/dev/accel/accel") == path) {
+                                size_t len = end - start;
+                                if (munmap((void*)start, len) == 0) {
+                                    n_closed++;
+                                    printf("  ✓  Unmapped NPU region 0x%lx-0x%lx (%zu MB) — device %s freed\n",
+                                           start, end, len / (1024*1024), path);
+                                } else {
+                                    fprintf(stderr, "  ⚠  munmap of 0x%lx failed: %s\n",
+                                            start, strerror(errno));
+                                }
                             }
                         }
                     }
+                    fclose(maps);
                 }
-                fclose(maps);
             }
 
             if (n_closed > 0) {

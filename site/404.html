@@ -3,6 +3,10 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="icon" type="image/svg+xml" href="assets/favicon.svg">
+  <link rel="icon" type="image/png" sizes="32x32" href="assets/favicon-32x32.png">
+  <link rel="icon" type="image/png" sizes="16x16" href="assets/favicon-16x16.png">
+  <link rel="apple-touch-icon" href="assets/apple-touch-icon.png">
   <title>Redirecting… — 1bit.MONSTER</title>
   <meta name="robots" content="noindex" />
   <link rel="canonical" href="https://1bit.monster/" />
@@ -12,6 +16,9 @@
     p { font-size: 14px; color: #555; }
     a { color: #1a56db; }
   </style>
+  <script type="application/ld+json">
+  {"@context": "https://schema.org", "@type": "WebPage", "name": "Redirecting\u2026 \u2014 1bit.MONSTER", "description": "", "url": "https://1bit.monster/404.html", "publisher": {"@type": "Organization", "name": "1bit.MONSTER", "url": "https://1bit.monster"}}
+  </script>
 </head>
 <body>
   <h1>Taking you there…</h1>
@@ -19,6 +26,7 @@
   <p><a href="https://1bit.monster/">← Back to 1bit.monster</a></p>
 
   <script src="analytics.js"></script>
+<script src="https://context7.com/widget.js" data-library="/1bit-monster/1bit-monster"></script>
   <script>
     // Attribution redirect for /s/<sharer>/<team>/<medium>?next=<target>
     // GitHub Pages serves this 404 page for any unknown path, so an
@@ -33,7 +41,19 @@
         params.set("utm_medium", decodeURIComponent(seg[3]));
         params.set("share", decodeURIComponent(seg[1]));
         params.set("team", decodeURIComponent(seg[2]));
-        var target = new URLSearchParams(location.search).get("next") || "https://1bit.monster/";
+        // Only ever redirect to a real http(s) URL: rejects javascript:/data:/vbscript:
+        // and other scheme tricks coming from the untrusted ?next= query param.
+        var raw = new URLSearchParams(location.search).get("next") || "https://1bit.monster/";
+        var target;
+        try {
+          var u = new URL(raw, location.href);
+          if (u.protocol !== "https:" && u.protocol !== "http:") {
+            u = new URL("https://1bit.monster/");
+          }
+          target = u.href;
+        } catch (e) {
+          target = "https://1bit.monster/";
+        }
         document.getElementById("msg").textContent = "Redirecting to: " + target;
         // Give the beacon a moment to report this page load, then redirect.
         setTimeout(function () {
